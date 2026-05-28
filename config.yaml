@@ -1,0 +1,44 @@
+model:
+  path: "./models/qwen3.6-35b-a3b-ud-q4_k_m.gguf"
+  n_gpu_layers: -1
+  n_ctx: 131072
+  offload_kqv: false
+  flash_attn: true
+  use_mmap: true
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+  cors: false
+
+kv_cache:
+  dir: "~/.quenstar/kvcache"
+  space_mb: 8192
+  save_interval_tokens: 4096
+  tail_trim_tokens: 32
+  alignment_tokens: 2048
+  eviction_half_life_hours: 6.0
+  max_saved_sessions: 1000
+
+sampling:
+  default_temperature: 0.8
+  default_top_p: 0.9
+  default_top_k: 40
+  default_min_p: 0.05
+  default_repeat_penalty: 1.0
+  tool_call_temperature: 0.0
+  tool_call_top_p: 1.0
+  tool_call_top_k: 1
+
+generation:
+  max_tokens: 32768
+  stop_strings: []
+
+tool_calling:
+  enabled: true
+  exact_replay_cache_size: 100000
+  syntax_tokens_greedy_until: 0
+
+logging:
+  level: "INFO"
+  trace: false

@@ -1,0 +1,31 @@
+[project]
+name = "quenstar"
+version = "0.1.0"
+description = "Local LLM inference server with DS4-style disk KV cache. Maximizes VRAM for model weights by offloading context to system RAM."
+requires-python = ">=3.10"
+dependencies = [
+    "llama-cpp-python>=0.3.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "sse-starlette>=2.1.0",
+    "pyyaml>=6.0",
+    "python-multipart>=0.0.18",
+]
+
+[project.optional-dependencies]
+cuda = ["llama-cpp-python[cuda]>=0.3.0"]
+
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quenstar*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that need a GPU and a downloaded model",
+]
+testpaths = ["tests"]
+timeout = 300
