@@ -128,26 +128,26 @@ Max context: 128K desktop / 64K laptop. Use `--ctx 262144` for the 35B model max
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────┐
 │  QuenStar Server (Python/FastAPI)               │
-│                                                  │
+│                                                 │
 │  ┌───────────────┐    ┌──────────────────────┐  │
 │  │  OpenAI API   │    │  Session Manager     │  │
 │  │  /v1/models   │    │  single live session │  │
 │  │  /v1/chat     │    │  save/load/resume    │  │
 │  └───────┬───────┘    └────────┬─────────────┘  │
-│          │                     │                 │
+│          │                     │                │
 │  ┌───────┴─────────────────────┴─────────────┐  │
-│  │  Inference Engine (llama-cpp-python)       │  │
-│  │  Model on GPU VRAM, KV cache in system RAM │  │
-│  │  Temperature=0 during tool calls           │  │
-│  └────────────────────────────────────────────┘  │
-│                                                  │
-│  ┌────────────────────────────────────────────┐  │
-│  │  Disk KV Cache (~/.quenstar/kv/)           │  │
-│  │  SHA1-keyed .kv files, LRU eviction        │  │
-│  └────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────┘
+│  │  Inference Engine (llama-cpp-python)      │  │
+│  │  Model on GPU VRAM, KV cache in sys RAM   │  │
+│  │  Temperature=0 during tool calls          │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │  Disk KV Cache (~/.quenstar/kv/)          │  │
+│  │  SHA1-keyed .kv files, LRU eviction       │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
 ```
 
 ### Temperature 0 During Tool Calls
