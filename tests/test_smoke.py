@@ -106,6 +106,74 @@ class TestCLI:
         assert result.returncode != 0
 
 
+class TestInteractiveCLI:
+    """Test the interactive CLI chat mode."""
+
+    @pytest.mark.slow
+    def test_interactive_chat_generates_and_quits(self):
+        """Interactive mode loads model, responds to prompt, and quits cleanly."""
+        model = _find_model()
+        if not model:
+            pytest.skip("No GGUF model found in models/")
+
+        env = _set_env()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        proc = subprocess.Popen(
+            [
+                _venv_python(), "-m", "quenstar.cli",
+                "-m", model,
+                "--ctx", "512",
+                "--max-tokens", "10",
+                "--temp", "0",
+                "-i",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+        try:
+            stdout, stderr = proc.communicate(input="Say hi\n/quit\n", timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            pytest.fail(f"Interactive CLI timed out\nstdout:\n{stdout}\nstderr:\n{stderr}")
+
+        assert proc.returncode == 0, f"CLI exited {proc.returncode}:\n{stderr}"
+        assert "Assistant:" in stdout, f"No assistant response:\n{stdout}"
+        assert "tok/s:" in stdout or "tok/s" in stdout, f"No speed stats:\n{stdout}"
+
+    @pytest.mark.slow
+    def test_interactive_rejects_bad_file(self):
+        """Interactive CLI exits non-zero for invalid GGUF."""
+        with tempfile.NamedTemporaryFile(suffix=".gguf", delete=False) as f:
+            f.write(b"not a model")
+            bad_path = f.name
+
+        try:
+            result = subprocess.run(
+                [_venv_python(), "-m", "quenstar.cli", "-m", bad_path, "--ctx", "512", "-i"],
+                capture_output=True, text=True, timeout=30,
+                env=_set_env(),
+            )
+            assert result.returncode != 0
+        finally:
+            os.unlink(bad_path)
+
+    @pytest.mark.slow
+    def test_interactive_rejects_missing_file(self):
+        """Interactive CLI exits non-zero for missing file."""
+        result = subprocess.run(
+            [_venv_python(), "-m", "quenstar.cli", "-m", "/nonexistent/path.gguf", "--ctx", "512", "-i"],
+            capture_output=True, text=True, timeout=30,
+            env=_set_env(),
+        )
+        assert result.returncode != 0
+
+
 class TestServer:
     """Test the HTTP server endpoints."""
 

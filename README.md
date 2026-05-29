@@ -79,6 +79,65 @@ Add to `~/.config/opencode/opencode.json`:
 
 Then `opencode --agent quenstar`.
 
+## Interactive CLI
+
+In addition to the server, QuenStar has a built-in interactive chat mode for
+talking to the model directly in the terminal.
+
+```bash
+# Using the config-aware entry point
+python -m quenstar --chat
+
+# Standalone CLI with interactive mode
+python -m quenstar.cli -m ./models/qwen3.6-35b-a3b-ud-q4_k_m.gguf -i
+
+# With a system prompt
+python -m quenstar.cli -m ./models/qwen3.6-35b-a3b-ud-q4_k_m.gguf -i -s "You are a helpful assistant."
+```
+
+Once loaded, you'll see:
+
+```
+Interactive chat mode. Type your message and press Enter.
+Commands: /quit, /exit, /clear, /system <prompt>
+─────────────────────────────────────────────────────────────
+
+You: Write a Python hello world
+Assistant: Here's a simple Python hello world:
+...streaming tokens...
+  [120 tok, ttft 0.3s, 45 tok/s]
+
+You:
+```
+
+### Commands
+
+| Command | Action |
+|---------|--------|
+| `/quit`, `/exit`, `/q` | Exit the chat |
+| `/clear` | Clear conversation (keeps system prompt) |
+| `/system <prompt>` | Set or change the system prompt |
+
+Press `Ctrl+C` during a response to interrupt generation without exiting.
+Press `Ctrl+C` on an empty prompt to exit.
+
+### CLI flags
+
+```
+python -m quenstar.cli --help
+  -m, --model PATH       Path to GGUF model file (required)
+  -i, --interactive      Interactive chat mode
+  -s, --system PROMPT    System prompt (interactive mode only)
+  -p, --prompt TEXT      One-shot prompt (default: "Say hello in one sentence.")
+  --ctx N                Context size (default: from config.yaml)
+  --n-gpu-layers N       GPU layers, -1 = all (default: -1)
+  --temp F               Temperature (default: from config.yaml)
+  --top-p F              Top-p sampling (default: from config.yaml)
+  --top-k N              Top-k sampling (default: from config.yaml)
+  --max-tokens N         Max tokens to generate (default: from config.yaml)
+  --offload-kqv 0|1      KV cache: 0=RAM, 1=GPU (default: 0)
+```
+
 ## run.sh Usage
 
 ```
@@ -206,6 +265,9 @@ Tests cover:
 | `test_cli_loads_and_generates` | Model loads, produces tokens |
 | `test_cli_rejects_bad_file` | Invalid GGUF → exit non-zero |
 | `test_cli_rejects_missing_file` | Missing file → exit non-zero |
+| `test_interactive_chat_generates_and_quits` | Interactive mode streams response, quits cleanly |
+| `test_interactive_rejects_bad_file` | Interactive mode: invalid GGUF → exit non-zero |
+| `test_interactive_rejects_missing_file` | Interactive mode: missing file → exit non-zero |
 | `test_health_endpoint` | `/health` returns ok |
 | `test_models_endpoint` | `/v1/models` lists models |
 | `test_chat_non_stream` | Non-streaming completion |

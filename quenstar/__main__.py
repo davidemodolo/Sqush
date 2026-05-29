@@ -72,6 +72,12 @@ def main():
         default=False,
         help="Run quick CLI inference test instead of server",
     )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        default=False,
+        help="Run interactive CLI chat mode instead of server",
+    )
 
     args = parser.parse_args()
 
@@ -113,6 +119,11 @@ def main():
         from .cli import main as cli_main
         sys.argv = ["quenstar-cli", "-m", config.model.path]
         cli_main()
+        return
+
+    if args.chat:
+        from .cli import run_interactive_chat
+        run_interactive_chat(config)
         return
 
     from .server import run_server
