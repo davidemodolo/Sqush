@@ -182,8 +182,36 @@ class Engine:
             tool_choice = request.tool_choice
 
         force_greedy = has_tools and tool_choice in ("required", "auto")
+        logits_processor = None
 
-        if force_greedy:
+        if force_greedy and self.config.tool_calling.manual_token_loop:
+            yield from self._do_manual_stream(request)
+            return
+
+        if force_greedy and self.config.tool_calling.greedy_tool_syntax:
+            # DS4-style: greedy ONLY on tool-call syntax via a per-token logits
+            # processor; sample argument payloads + content at payload_temperature
+            # (opencode pins temperature=0, so fall back to it for any sampling).
+            if request.temperature is not None and request.temperature > 0:
+                temperature = request.temperature
+            else:
+                temperature = self.config.tool_calling.payload_temperature
+            _, top_p, top_k, min_p = self._resolve_sampling_params(request)
+            try:
+                from llama_cpp import LogitsProcessorList
+
+                from .toolcall import ToolSyntaxGreedyProcessor
+
+                logits_processor = LogitsProcessorList([ToolSyntaxGreedyProcessor(self._llm)])
+                _log.debug("Tool-calling: greedy on syntax, payloads at temp=%.3f", temperature)
+            except Exception as exc:
+                _log.warning("greedy-syntax processor unavailable (%s); whole-gen greedy", exc)
+                tc = self.config.sampling
+                temperature, top_p, top_k, min_p = (
+                    tc.tool_call_temperature, tc.tool_call_top_p,
+                    tc.tool_call_top_k, tc.default_min_p,
+                )
+        elif force_greedy:
             tc = self.config.sampling
             temperature = tc.tool_call_temperature
             top_p = tc.tool_call_top_p
@@ -192,10 +220,6 @@ class Engine:
             _log.debug("Tool-calling mode: temperature=%.1f for deterministic syntax", temperature)
         else:
             temperature, top_p, top_k, min_p = self._resolve_sampling_params(request)
-
-        if force_greedy and self.config.tool_calling.manual_token_loop:
-            yield from self._do_manual_stream(request)
-            return
 
         if temperature > 0 and request.seed is not None:
             seed = request.seed
@@ -237,6 +261,7 @@ class Engine:
                 stream=request.stream,
                 seed=seed,
                 repeat_penalty=self.config.sampling.default_repeat_penalty,
+                logits_processor=logits_processor,
                 **chat_kwargs,
             )
         except Exception as exc:

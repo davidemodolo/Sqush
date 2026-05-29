@@ -73,6 +73,8 @@ class ToolCallingConfig:
     enabled: bool = True
     exact_replay_cache_size: int = 100000
     manual_token_loop: bool = False
+    greedy_tool_syntax: bool = True
+    payload_temperature: float = 0.7
 
 
 @dataclass

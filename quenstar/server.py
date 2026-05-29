@@ -14,7 +14,12 @@ from .config import QuenStarConfig
 from .engine import Engine
 from .kvstore import KVCacheStore
 from .session import SessionManager
-from .toolcall import ToolCallRegistry, replay_tool_calls
+from .toolcall import (
+    StreamingToolCallParser,
+    ToolCallRegistry,
+    replay_tool_calls,
+    split_content_and_tool_calls,
+)
 from .types import ChatCompletionRequest
 
 _log = logging.getLogger(__name__)
@@ -260,8 +265,15 @@ async def _non_stream_chat(
         message = {}
         finish_reason = "stop"
 
-    content = message.get("content", "")
-    tool_calls = message.get("tool_calls", [])
+    content = message.get("content") or ""
+    tool_calls = message.get("tool_calls") or []
+    # llama-cpp's auto-detected formatter returns tool calls as raw
+    # "<tool_call>...</tool_call>" text in content, not structured tool_calls.
+    if not tool_calls and content:
+        content, parsed = split_content_and_tool_calls(content)
+        tool_calls = _finalize_tool_calls(parsed, registry)
+    if tool_calls:
+        finish_reason = "tool_calls"
 
     usage = {
         "prompt_tokens": prompt_tokens,
@@ -293,98 +305,99 @@ async def _stream_chat(
     request: ChatCompletionRequest,
     registry: ToolCallRegistry,
 ) -> AsyncIterator[dict[str, Any]]:
+    stream_id = _gen_id("chatcmpl-")
+    parser = StreamingToolCallParser()
     accumulated_content = ""
-    accumulated_tool_calls: list[dict[str, Any]] = []
-    final_finish = "stop"
-    chunk_count = 0
+    emitted_tool_calls: list[dict[str, Any]] = []
+    next_index = 0
+    model_finish = "stop"
+    errored = False
     prompt_tokens = engine.n_tokens
 
-    _log.debug("stream start: prompt_tokens=%d", prompt_tokens)
+    def chunk(delta: dict[str, Any], finish_reason: Any = None,
+              usage: dict[str, Any] | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": engine.model_id,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            body["usage"] = usage
+        return {"data": json.dumps(body)}
+
+    yield chunk({"role": "assistant"})
+
     try:
-        for chunk in engine.chat_completion(request):
-            chunk_count += 1
-            choices = chunk.get("choices", [])
+        for raw_chunk in engine.chat_completion(request):
+            choices = raw_chunk.get("choices", [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or choice.get("message") or {}
 
-            if chunk_count <= 5 or chunk.get("choices", [{}])[0].get("finish_reason"):
-                _log.debug("  raw chunk #%d: %s", chunk_count,
-                           {k: v for k, v in chunk.items() if k != "model"})
+            # Forward any structured tool calls the handler already produced.
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                yield chunk({"tool_calls": [dict(tc, index=idx)]})
+                emitted_tool_calls.append({
+                    "id": tc.get("id"), "type": "function",
+                    "function": tc.get("function", {}),
+                })
 
-            if choices:
-                choice = choices[0]
+            content_piece = delta.get("content") or ""
+            if content_piece:
+                text, parsed = parser.feed(content_piece)
+                if text:
+                    accumulated_content += text
+                    yield chunk({"content": text})
+                for tc in parsed:
+                    raw = tc.pop("_raw", None)
+                    if raw:
+                        registry.register(tc["id"], raw)
+                    emitted_tool_calls.append(tc)
+                    yield chunk({"tool_calls": [dict(tc, index=next_index)]})
+                    next_index += 1
 
-                delta = choice.get("delta") or {}
-                message = choice.get("message") or {}
+            if choice.get("finish_reason"):
+                model_finish = choice["finish_reason"]
 
-                choice_data = delta if delta else message
-
-                content_delta = choice_data.get("content", "")
-                if content_delta:
-                    accumulated_content += content_delta
-
-                tool_delta = choice_data.get("tool_calls", [])
-                if tool_delta:
-                    accumulated_tool_calls.extend(tool_delta)
-
-                if choice.get("finish_reason"):
-                    final_finish = choice["finish_reason"]
-
-                if chunk_count <= 3 or chunk_count % 50 == 0 or choice.get("finish_reason"):
-                    _log.debug("stream chunk #%d: content_len=%d finish=%s",
-                               chunk_count, len(accumulated_content),
-                               choice.get("finish_reason"))
-
-            yield {"data": json.dumps(chunk)}
+        text, parsed = parser.flush()
+        if text:
+            accumulated_content += text
+            yield chunk({"content": text})
+        for tc in parsed:
+            raw = tc.pop("_raw", None)
+            if raw:
+                registry.register(tc["id"], raw)
+            emitted_tool_calls.append(tc)
+            yield chunk({"tool_calls": [dict(tc, index=next_index)]})
+            next_index += 1
 
     except Exception as exc:
+        errored = True
         _log.error("Stream error: %s", exc, exc_info=True)
         yield {"data": json.dumps({
-            "id": _gen_id("chatcmpl-"),
+            "id": stream_id,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": engine.model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "content": f"[ERROR: {exc}]",
-                    },
-                    "finish_reason": "error",
-                }
-            ],
-            "error": {
-                "message": str(exc),
-                "type": "server_error",
-            },
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+            "error": {"message": str(exc), "type": "server_error"},
         })}
-        return
 
-    _log.info("stream done: chunks=%d content_len=%d tool_calls=%d finish=%s tokens=[%d/%d/%d]",
-              chunk_count, len(accumulated_content), len(accumulated_tool_calls),
-              final_finish, prompt_tokens,
-              max(0, engine.n_tokens - prompt_tokens), engine.n_tokens)
-    assistant_msg: dict[str, Any] = _finalize_turn(
-        accumulated_content, accumulated_tool_calls, registry, session, request
-    )
+    finish_reason = "error" if errored else ("tool_calls" if emitted_tool_calls else model_finish)
+    yield chunk({}, finish_reason=finish_reason, usage={
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": max(0, engine.n_tokens - prompt_tokens),
+        "total_tokens": engine.n_tokens,
+    })
 
-    if final_finish != "stop":
-        yield {"data": json.dumps({
-            "id": _gen_id("chatcmpl-"),
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": engine.model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": max(0, engine.n_tokens - prompt_tokens),
-                "total_tokens": engine.n_tokens,
-            },
-        })}
+    if not errored:
+        _finalize_turn(accumulated_content, emitted_tool_calls, registry, session, request)
+
+    yield {"data": "[DONE]"}
 
 
 def _empty_response(model_id: str) -> dict[str, Any]:
@@ -414,11 +427,21 @@ def _finalize_turn(
     assistant_msg: dict[str, Any] = {"role": "assistant", "content": content or None}
     if tool_calls:
         assistant_msg["tool_calls"] = tool_calls
-        assistant_msg["content"] = None
-        _register_tool_content(registry, tool_calls, content)
     session.update(request.messages + [assistant_msg])
     session.save_checkpoint()
     return assistant_msg
+
+
+def _finalize_tool_calls(parsed: list[dict], registry: ToolCallRegistry) -> list[dict]:
+    """Register each parsed tool call's exact raw bytes (for byte-exact replay)
+    and strip the private ``_raw`` key before returning to the client."""
+    clean = []
+    for tc in parsed:
+        raw = tc.pop("_raw", None)
+        if raw and tc.get("id"):
+            registry.register(tc["id"], raw)
+        clean.append(tc)
+    return clean
 
 
 def _gen_id(prefix: str = "", length: int = 29) -> str:
