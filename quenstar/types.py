@@ -27,13 +27,14 @@ class KVCacheHeader:
     last_used_at: float = 0.0
     payload_bytes: int = 0
 
+    _STRUCT_FMT = "<4sIBBBxxQIIxxddQ"
     HEADER_SIZE = 64
 
     def pack(self) -> bytes:
         import struct
 
         return struct.pack(
-            "<4sIBBBxxQIIxxddQ",
+            self._STRUCT_FMT,
             self.magic,
             self.version,
             self.quant_bits,
@@ -51,6 +52,7 @@ class KVCacheHeader:
     def unpack(cls, data: bytes) -> "KVCacheHeader":
         import struct
 
+        hdr_size = struct.calcsize(cls._STRUCT_FMT)
         (
             magic,
             version,
@@ -63,7 +65,7 @@ class KVCacheHeader:
             created_at,
             last_used_at,
             payload_bytes,
-        ) = struct.unpack("<4sIBBBxxQIIxxddQ", data[: cls.HEADER_SIZE])
+        ) = struct.unpack(cls._STRUCT_FMT, data[:hdr_size])
         return cls(
             magic=magic,
             version=version,
@@ -80,23 +82,6 @@ class KVCacheHeader:
 
 
 @dataclass
-class Session:
-    id: str
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    n_tokens: int = 0
-    created_at: float = 0.0
-    last_used_at: float = 0.0
-
-
-@dataclass
-class ToolCall:
-    id: str
-    function_name: str
-    arguments: str
-    raw_dsml: Optional[str] = None
-
-
-@dataclass
 class ChatCompletionRequest:
     model: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -109,6 +94,7 @@ class ChatCompletionRequest:
     tools: Optional[list[dict[str, Any]]] = None
     tool_choice: Any = None
     stop: Optional[list[str]] = None
+    enable_thinking: Optional[bool] = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ChatCompletionRequest":
@@ -124,4 +110,5 @@ class ChatCompletionRequest:
             tools=data.get("tools"),
             tool_choice=data.get("tool_choice"),
             stop=data.get("stop"),
+            enable_thinking=data.get("enable_thinking"),
         )

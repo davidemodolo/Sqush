@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
-import json
 import logging
 import math
-import os
 import struct
 import time
 from pathlib import Path
@@ -15,9 +13,6 @@ from .config import KVCacheConfig
 from .types import KVCacheHeader, KVSaveReason
 
 _log = logging.getLogger(__name__)
-
-FLAG_TOOL_ID_MAP = 1 << 0
-
 
 class KVCacheStore:
     def __init__(self, config: KVCacheConfig, model_id: str, n_ctx: int, quant_bits: int = 4):
@@ -38,7 +33,6 @@ class KVCacheStore:
         key: str,
         state_bytes: bytes,
         reason: KVSaveReason = KVSaveReason.COLD,
-        model_id: str = "",
     ) -> str:
         filepath = self._dir / f"{key}.kv"
 
@@ -81,8 +75,9 @@ class KVCacheStore:
     ) -> Optional[tuple[str, bytes, KVCacheHeader]]:
         try:
             with open(filepath, "rb") as f:
-                header_data = f.read(KVCacheHeader.HEADER_SIZE)
-                if len(header_data) < KVCacheHeader.HEADER_SIZE:
+                hdr_size = struct.calcsize(KVCacheHeader._STRUCT_FMT)
+                header_data = f.read(hdr_size)
+                if len(header_data) < hdr_size:
                     _log.warning("Truncated KV file header: %s", filepath)
                     return None
 
@@ -144,13 +139,14 @@ class KVCacheStore:
 
     def list_files(self) -> list[dict]:
         results = []
+        hdr_size = struct.calcsize(KVCacheHeader._STRUCT_FMT)
         for filepath in sorted(
             self._dir.glob("*.kv"), key=lambda p: p.stat().st_mtime, reverse=True
         ):
             try:
                 with open(filepath, "rb") as f:
-                    header_data = f.read(KVCacheHeader.HEADER_SIZE)
-                    if len(header_data) < KVCacheHeader.HEADER_SIZE:
+                    header_data = f.read(hdr_size)
+                    if len(header_data) < hdr_size:
                         continue
                     header = KVCacheHeader.unpack(header_data)
                     if header.magic != b"QSTK":
@@ -194,9 +190,10 @@ class KVCacheStore:
         for finfo in files:
             if finfo["key"] == keep:
                 continue
-            if self.total_size_bytes() <= space_limit:
+            if current <= space_limit:
                 break
             self.delete(finfo["key"])
+            current -= finfo["file_size"]
             _log.debug("Evicted KV cache: %s", finfo["key"])
 
     def _eviction_score(self, finfo: dict) -> float:

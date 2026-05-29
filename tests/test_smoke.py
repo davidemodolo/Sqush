@@ -350,3 +350,72 @@ class TestServer:
         finally:
             proc.terminate()
             proc.wait()
+
+    @pytest.mark.slow
+    def test_chat_missing_messages_400(self):
+        model = _find_model()
+        if not model:
+            pytest.skip("No GGUF model found in models/")
+
+        port = 18996
+        proc = self._start_server(model, port=port)
+        try:
+            status, body = self._fetch(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                method="POST",
+                body={"model": "test"},
+            )
+            assert status == 400
+            data = json.loads(body)
+            assert "error" in data
+            assert "messages" in str(data["error"]).lower()
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    @pytest.mark.slow
+    def test_chat_invalid_json_400(self):
+        model = _find_model()
+        if not model:
+            pytest.skip("No GGUF model found in models/")
+
+        port = 18997
+        proc = self._start_server(model, port=port)
+        try:
+            import urllib.error
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=b"not json",
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            try:
+                urllib.request.urlopen(req, timeout=10)
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
+                data = json.loads(e.read().decode())
+                assert "error" in data
+        finally:
+            proc.terminate()
+            proc.wait()
+
+    @pytest.mark.slow
+    def test_health_vram_endpoint(self):
+        model = _find_model()
+        if not model:
+            pytest.skip("No GGUF model found in models/")
+
+        port = 18998
+        proc = self._start_server(model, port=port)
+        try:
+            status, body = self._fetch(f"http://127.0.0.1:{port}/health/vram")
+            assert status == 200
+            data = json.loads(body)
+            assert "model_path" in data
+            assert "n_ctx" in data
+            assert "gpus" in data or "error" in data
+        finally:
+            proc.terminate()
+            proc.wait()

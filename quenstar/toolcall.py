@@ -10,9 +10,8 @@ _log = logging.getLogger(__name__)
 
 TOOL_CALL_PATTERNS = [
     re.compile(r"<tool_call\s*>"),
-    re.compile(r"<\|tool▁calls▁begin\|>"),
-    re.compile(r"<\|tool_calls_section\|>"),
-    re.compile(r"<\|startoftext\|>\s*<\|tool_calls▁begin\|>"),
+    re.compile(r"<\|tool\u2581calls\u2581begin\|>"),
+    re.compile(r"<\|startoftext\|>\s*<\|tool\u2581calls\u2581begin\|>"),
 ]
 
 TOOL_CALL_END_PATTERNS = [
@@ -24,8 +23,6 @@ TOOL_CALL_END_PATTERNS = [
 class ToolCallDetector:
     def __init__(self):
         self._in_tool_call: bool = False
-        self._tool_call_depth: int = 0
-        self._pending_tool_calls: list[dict[str, Any]] = []
         self._tool_buffer: str = ""
 
     def feed(self, text: str) -> tuple[bool, list[dict[str, Any]]]:
@@ -35,7 +32,6 @@ class ToolCallDetector:
             for pattern in TOOL_CALL_PATTERNS:
                 if pattern.search(self._tool_buffer):
                     self._in_tool_call = True
-                    self._tool_call_depth = 0
                     _log.debug("Tool call detected in output stream")
                     break
 
@@ -76,16 +72,16 @@ class ToolCallDetector:
                 _log.debug("Incomplete tool call JSON, waiting for more tokens")
 
         for match in re.finditer(
-            r'<\|tool▁calls▁begin\|>(.*?)<\|tool▁calls▁end\|>', text, re.DOTALL
+            r'<\|tool\u2581calls\u2581begin\|>(.*?)<\|tool\u2581calls\u2581end\|>', text, re.DOTALL
         ):
             inner = match.group(1).strip()
             parsed = self._parse_qwen_tool_block(inner)
             if parsed:
-                result.append(parsed)
+                result.extend(parsed)
 
         return result
 
-    def _parse_qwen_tool_block(self, inner: str) -> Optional[dict[str, Any]]:
+    def _parse_qwen_tool_block(self, inner: str) -> list[dict[str, Any]]:
         try:
             data = json.loads(inner)
             if isinstance(data, list):
@@ -100,77 +96,40 @@ class ToolCallDetector:
                             "arguments": json.dumps(fn.get("arguments", {}), ensure_ascii=False),
                         },
                     })
-                return calls[0] if calls else None
+                return calls
             elif isinstance(data, dict):
-                return {
+                return [{
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "function",
                     "function": {
                         "name": data.get("name", ""),
                         "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
                     },
-                }
+                }]
         except json.JSONDecodeError:
             pass
-        return None
+        return []
 
     def reset(self):
         self._in_tool_call = False
-        self._tool_call_depth = 0
-        self._pending_tool_calls = []
         self._tool_buffer = ""
 
 
 class ToolCallRegistry:
     def __init__(self, max_entries: int = 100000):
         self._registry: dict[str, str] = {}
-        self._raw_content: dict[str, str] = {}
         self._max_entries = max_entries
 
     def register(self, tool_id: str, raw_text: str):
         self._registry[tool_id] = raw_text
         self._trim()
 
-    def register_content(self, key: str, raw_content: str):
-        self._raw_content[key] = raw_content
-        self._trim()
-
     def lookup(self, tool_id: str) -> Optional[str]:
         return self._registry.get(tool_id)
 
-    def lookup_content(self, key: str) -> Optional[str]:
-        return self._raw_content.get(key)
-
     def _trim(self):
-        while len(self._registry) + len(self._raw_content) > self._max_entries:
-            if self._raw_content:
-                self._raw_content.pop(next(iter(self._raw_content)))
-            elif self._registry:
-                self._registry.pop(next(iter(self._registry)))
-            else:
-                break
-
-
-def extract_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
-    calls = []
-    for match in re.finditer(
-        r'<tool_call>\s*(.*?)\s*</tool_call>', text, re.DOTALL
-    ):
-        inner = match.group(1).strip()
-        try:
-            data = json.loads(inner)
-            if "name" in data:
-                calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {
-                        "name": data["name"],
-                        "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                    },
-                })
-        except json.JSONDecodeError:
-            pass
-    return calls
+        while len(self._registry) > self._max_entries:
+            self._registry.pop(next(iter(self._registry)))
 
 
 def replay_tool_calls(

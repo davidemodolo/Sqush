@@ -4,13 +4,13 @@ Next steps for QuenStar, roughly ordered by priority.
 
 ## Core Features
 
-- [~] **Per-token temperature 0 during tool calls** — currently we force temp=0 for the *entire* generation when tools are present. DS4 does better: it uses greedy decoding only for tool call *syntax* (tags, JSON structure) while keeping normal sampling for *payloads* (code, file contents). ~~Requires implementing the manual token generation loop from `engine.py` with the `ToolCallDetector` state machine from `toolcall.py`.~~ **Manual loop done** (`engine.py:_do_manual_stream` — prefill then per-token `sample()`/`eval()` with `ToolCallDetector`). Not yet enabled by default; `chat_completion` still routes through `_do_chat_completion`.
+- [x] **Per-token temperature 0 during tool calls** — ~~currently we force temp=0 for the *entire* generation when tools are present.~~ **Done.** `_do_manual_stream` uses `create_chat_completion(max_tokens=1)` for prefill then per-token `sample()`/`eval()` with `ToolCallDetector` switching temp=0 inside tool call syntax. Enabled via `tool_calling.manual_token_loop` config (defaults to false).
 
 - [ ] **Non-streaming response path** — the streaming endpoint works, but the non-streaming path in `_non_stream_chat` receives a single dict from `create_chat_completion` and wraps it. Needs testing with opencode (which may prefer non-streaming in some modes).
 
 - [x] **Exact DSML/text tool call replay** — ~~when a model generates a tool call, store the exact bytes it produced (in `ToolCallRegistry`). When the client sends the result back, replay those exact bytes instead of re-formatting. Prevents KV cache mismatch when clients normalize JSON keys.~~ **Done.** `toolcall.py:replay_tool_calls()` rewrites messages before inference, `server.py:_register_tool_content()` stores raw text after generation. `ToolCallRegistry` tracks by tool call ID with bound LRU trim.
 
-- [ ] **Temperature 0 during thinking/syntax detection** — `Qwen3.6-35B-A3B` emits `<think>...</think>` blocks by default. We should suppress or control this per-request. The model's chat template may accept a `thinking: false` parameter or an `enable_thinking` flag.
+- [x] **Temperature 0 during thinking/syntax detection** — ~~`Qwen3.6-35B-A3B` emits `<think>...</think>` blocks by default. We should suppress or control this per-request.~~ **Done.** `enable_thinking` parameter added to `ChatCompletionRequest` and passed through to llama-cpp-python's chat template. Set `"enable_thinking": false` in the API request body.
 
 ## Model Support
 
@@ -24,13 +24,13 @@ Next steps for QuenStar, roughly ordered by priority.
 
 - [ ] **Download from HF mirrors** — the `run.sh` download uses `unsloth` repos which require authentication. Add fallback mirrors (`bartowski`, `lmstudio-community`, `ggml-org`) and `hf download` command support.
 
-- [ ] **Vision/image input (multimodal)** — Qwen3.6-35B-A3B includes a custom vision encoder (has full Vision Language benchmarks on HF). Requires: (1) a GGUF with the vision encoder bundled or a separate `mmproj-*.gguf`, (2) llama-cpp-python built with `-DGGML_LLAVA=on` (cmake needed, not in pre-built wheel), (3) image processing pipeline and `/v1/chat/completions` image payload support. Note: Ollama already ships a vision-capable Q4_K_M GGUF of this model.
+- [x] **Vision/image input (multimodal)** — **Done.** `Llava15ChatHandler` passes `clip_model_path` to Llama constructor via `chat_handler=`. llama-cpp-python 0.3.23 handles images through `libmtmd.so` internally. `create_chat_completion` processes `image_url` content parts automatically. `run.sh` auto-downloads `mmproj-F16.gguf` (899MB) from unsloth on desktop. Error responses: 400/501.
 
 ## Performance
 
 - [ ] **Pre-fill chunk tuning** — the default `n_batch=4096` balances prefill speed vs VRAM. Expose as a config option and auto-tune per mode.
 
-- [ ] **YaRN RoPE scaling for >262K context** — Qwen3.6 supports up to 1M tokens via YaRN position embedding extension (`rope_type: yarn`, `factor: 4.0`). Quality degrades past native 262K. llama.cpp supports this via `--yarn-ext-factor`. Expose in config.
+- [x] **YaRN RoPE scaling for >262K context** — ~~Qwen3.6 supports up to 1M tokens via YaRN position embedding extension (`rope_type: yarn`, `factor: 4.0`). Quality degrades past native 262K. llama.cpp supports this via `--yarn-ext-factor`. Expose in config.~~ **Done.** Added `yarn_ext_factor`, `yarn_attn_factor`, `yarn_beta_fast`, `yarn_beta_slow` to `ModelConfig` and passed to llama-cpp-python. Set `yarn_ext_factor: 4.0` in config.yaml to activate (default -1 = disabled).
 
 - [ ] **Flash attention verification** — `flash_attn=True` is set but needs benchmarking to confirm it helps on the RTX 3090 (compute 8.6). If not, switch to standard attention.
 

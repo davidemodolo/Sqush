@@ -7,7 +7,7 @@ import shutil
 import sys
 import time
 
-from .config import QuenStarConfig
+from .config import QuenStarConfig, apply_cli_overrides
 from .engine import Engine
 from .types import ChatCompletionRequest
 
@@ -30,35 +30,20 @@ def run_interactive_chat(config: QuenStarConfig, system_prompt: str | None = Non
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="QuenStar CLI — test model inference")
-    parser.add_argument("-m", "--model", required=True, help="Path to GGUF model")
+    from .config import add_shared_model_args
+    add_shared_model_args(parser)
     parser.add_argument("-i", "--interactive", action="store_true", help="Interactive chat mode")
     parser.add_argument("-s", "--system", default=None, help="System prompt (interactive mode)")
     parser.add_argument("-p", "--prompt", default="Say hello in one sentence.")
-    parser.add_argument("--ctx", type=int, default=None, help="Context size (default: from config)")
-    parser.add_argument("--n-gpu-layers", type=int, default=-1, help="GPU layers (-1=all)")
-    parser.add_argument("--temp", type=float, default=None, help="Temperature (default: from config)")
-    parser.add_argument("--top-p", type=float, default=None, help="Top-p (default: from config)")
-    parser.add_argument("--top-k", type=int, default=None, help="Top-k (default: from config)")
-    parser.add_argument("--max-tokens", type=int, default=None, help="Max tokens (default: from config)")
-    parser.add_argument("--offload-kqv", type=int, default=0, help="1=KV on GPU, 0=KV in RAM")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.model:
+        parser.error("-m/--model is required")
+    return args
 
 
 def _build_config(args):
     config = QuenStarConfig.load()
-    config.model.path = args.model
-    if args.ctx is not None:
-        config.model.n_ctx = args.ctx
-    config.model.n_gpu_layers = args.n_gpu_layers
-    config.model.offload_kqv = bool(args.offload_kqv)
-    if args.max_tokens is not None:
-        config.generation.max_tokens = args.max_tokens
-    if args.temp is not None:
-        config.sampling.default_temperature = args.temp
-    if args.top_p is not None:
-        config.sampling.default_top_p = args.top_p
-    if args.top_k is not None:
-        config.sampling.default_top_k = args.top_k
+    apply_cli_overrides(config, args)
     return config
 
 
@@ -168,7 +153,8 @@ def _chat_loop(engine, system_prompt=None):
                     except KeyboardInterrupt:
                         break
             except KeyboardInterrupt:
-                pass
+                engine.reset_context()
+                full_response = ""
             except Exception as exc:
                 print(f"\nERROR during inference: {exc}", file=sys.stderr)
                 continue

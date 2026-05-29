@@ -15,13 +15,13 @@ class Engine:
     def __init__(self, config: QuenStarConfig):
         self.config = config
         self._llm = None
+        self._chat_handler = None
         self._lock = threading.Lock()
         self._total_eval_tokens: int = 0
         self._load_model()
 
     def _load_model(self):
         import os
-        import sys
 
         import llama_cpp
 
@@ -29,7 +29,7 @@ class Engine:
 
         if not os.path.isfile(model_cfg.path):
             _log.error("Model file not found: %s", model_cfg.path)
-            sys.exit(1)
+            raise FileNotFoundError(f"Model file not found: {model_cfg.path}")
 
         file_size = os.path.getsize(model_cfg.path)
         if file_size < 1024:
@@ -38,14 +38,14 @@ class Engine:
                 snippet = f.read(200)
             _log.error("File contents: %s", snippet)
             _log.error("The file is not a valid GGUF model. Delete it and re-download.")
-            sys.exit(1)
+            raise RuntimeError(f"File is not a valid GGUF model (too small): {model_cfg.path}")
 
         with open(model_cfg.path, "rb") as f:
             magic = f.read(4)
         if magic != b"GGUF":
             _log.error("File is not a valid GGUF model (magic bytes: %r): %s", magic, model_cfg.path)
             _log.error("Expected 'GGUF', got %r. Delete this file and re-download.", magic.decode(errors="replace"))
-            sys.exit(1)
+            raise RuntimeError(f"Not a valid GGUF model: {model_cfg.path}")
 
         if model_cfg.n_gpu_layers != 0 and not llama_cpp.llama_supports_gpu_offload():
             _log.warning(
@@ -66,13 +66,21 @@ class Engine:
                 model_path=model_cfg.path,
                 n_gpu_layers=model_cfg.n_gpu_layers,
                 n_ctx=model_cfg.n_ctx,
+                n_batch=model_cfg.n_batch,
+                n_ubatch=model_cfg.n_ubatch,
                 offload_kqv=model_cfg.offload_kqv,
                 flash_attn=model_cfg.flash_attn,
                 use_mmap=model_cfg.use_mmap,
                 use_mlock=False,
                 verbose=False,
                 seed=-1,
-                n_batch=4096,
+                type_k=model_cfg.type_k,
+                type_v=model_cfg.type_v,
+                yarn_ext_factor=model_cfg.yarn_ext_factor,
+                yarn_attn_factor=model_cfg.yarn_attn_factor,
+                yarn_beta_fast=model_cfg.yarn_beta_fast,
+                yarn_beta_slow=model_cfg.yarn_beta_slow,
+                chat_handler=self._chat_handler,
             )
         except ValueError as exc:
             _log.error("Failed to load model: %s", exc)
@@ -81,7 +89,7 @@ class Engine:
                     "This model may require a newer version of llama.cpp. "
                     "Try: pip install --upgrade llama-cpp-python"
                 )
-            sys.exit(1)
+            raise
 
         _log.info(
             "Model loaded. VRAM: model ~%.1f GB, KV cache in %s (context: %d tokens)",
@@ -89,6 +97,19 @@ class Engine:
             "system RAM" if not model_cfg.offload_kqv else "GPU",
             model_cfg.n_ctx,
         )
+
+        if model_cfg.mmproj_path and os.path.isfile(model_cfg.mmproj_path):
+            self._load_mmproj(model_cfg.mmproj_path)
+
+    def _load_mmproj(self, mmproj_path: str):
+        from llama_cpp.llama_chat_format import Llava15ChatHandler
+
+        try:
+            self._chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path, verbose=False)
+            self._llm.chat_handler = self._chat_handler
+            _log.info("Vision encoder loaded: %s", mmproj_path)
+        except Exception as exc:
+            _log.warning("Failed to load vision encoder: %s", exc)
 
     def _estimate_model_size_gb(self) -> float:
         try:
@@ -138,33 +159,43 @@ class Engine:
         with self._lock:
             yield from self._do_manual_stream(request)
 
+    def _resolve_sampling_params(self, request: ChatCompletionRequest):
+        s = self.config.sampling
+        return (
+            request.temperature if request.temperature is not None else s.default_temperature,
+            request.top_p if request.top_p is not None else s.default_top_p,
+            request.top_k if request.top_k is not None else s.default_top_k,
+            s.default_min_p,
+        )
+
     def _do_chat_completion(
         self,
         request: ChatCompletionRequest,
     ) -> Iterator[dict[str, Any]]:
-        sampling = self.config.sampling
         gen_cfg = self.config.generation
 
-        has_tools = bool(request.tools)
-        tool_choice = request.tool_choice
+        if not self.config.tool_calling.enabled:
+            has_tools = False
+            tool_choice = None
+        else:
+            has_tools = bool(request.tools)
+            tool_choice = request.tool_choice
 
-        force_greedy = has_tools and (
-            tool_choice == "required"
-            or tool_choice == "auto"
-            or (tool_choice is None and has_tools)
-        )
+        force_greedy = has_tools and tool_choice in ("required", "auto")
 
         if force_greedy:
-            temperature = 0.0
-            top_p = 1.0
-            top_k = 1
-            min_p = 0.0
-            _log.debug("Tool-calling mode: forcing temperature=0 for deterministic syntax")
+            tc = self.config.sampling
+            temperature = tc.tool_call_temperature
+            top_p = tc.tool_call_top_p
+            top_k = tc.tool_call_top_k
+            min_p = self.config.sampling.default_min_p
+            _log.debug("Tool-calling mode: temperature=%.1f for deterministic syntax", temperature)
         else:
-            temperature = request.temperature if request.temperature is not None else sampling.default_temperature
-            top_p = request.top_p if request.top_p is not None else sampling.default_top_p
-            top_k = request.top_k if request.top_k is not None else sampling.default_top_k
-            min_p = sampling.default_min_p
+            temperature, top_p, top_k, min_p = self._resolve_sampling_params(request)
+
+        if force_greedy and self.config.tool_calling.manual_token_loop:
+            yield from self._do_manual_stream(request)
+            return
 
         if temperature > 0 and request.seed is not None:
             seed = request.seed
@@ -174,7 +205,11 @@ class Engine:
             seed = int(time.time() * 1000) % (2**31)
 
         max_tokens = request.max_tokens if request.max_tokens is not None else gen_cfg.max_tokens
-        stop = request.stop if request.stop else None
+        stop = request.stop if request.stop else gen_cfg.stop_strings or None
+
+        chat_kwargs: dict[str, Any] = {}
+        if request.enable_thinking is not None:
+            chat_kwargs["enable_thinking"] = request.enable_thinking
 
         _log.debug(
             "chat_completion: stream=%s temp=%.3f top_p=%.3f top_k=%d max_tokens=%d seed=%d tools=%d",
@@ -186,6 +221,7 @@ class Engine:
             seed,
             len(request.tools) if request.tools else 0,
         )
+        _log.info("inference start: %d tokens in context", self._llm.n_tokens)
 
         try:
             result = self._llm.create_chat_completion(
@@ -200,7 +236,8 @@ class Engine:
                 stop=stop if stop else None,
                 stream=request.stream,
                 seed=seed,
-                repeat_penalty=sampling.default_repeat_penalty,
+                repeat_penalty=self.config.sampling.default_repeat_penalty,
+                **chat_kwargs,
             )
         except Exception as exc:
             _log.error("Inference failed: %s", exc)
@@ -211,6 +248,13 @@ class Engine:
                 yield chunk
         else:
             yield result
+
+        try:
+            self._total_eval_tokens = self._llm.n_tokens
+        except Exception:
+            pass
+
+        _log.info("inference done: %d tokens in context", self._total_eval_tokens)
 
     def save_state(self) -> bytes:
         import pickle
@@ -247,21 +291,17 @@ class Engine:
     ) -> Iterator[dict[str, Any]]:
         from .toolcall import ToolCallDetector
 
-        sampling = self.config.sampling
         gen_cfg = self.config.generation
 
-        has_tools = bool(request.tools)
-        tool_choice = request.tool_choice
-        force_greedy = has_tools and (
-            tool_choice == "required"
-            or tool_choice == "auto"
-            or (tool_choice is None and has_tools)
-        )
+        temperature, top_p, top_k, min_p = self._resolve_sampling_params(request)
 
-        temperature = request.temperature if request.temperature is not None else sampling.default_temperature
-        top_p = request.top_p if request.top_p is not None else sampling.default_top_p
-        top_k = request.top_k if request.top_k is not None else sampling.default_top_k
-        min_p = sampling.default_min_p
+        max_tokens = request.max_tokens if request.max_tokens is not None else gen_cfg.max_tokens
+
+        chat_kwargs: dict[str, Any] = {}
+        if request.enable_thinking is not None:
+            chat_kwargs["enable_thinking"] = request.enable_thinking
+
+        _log.debug("Manual stream: per-token greedy inside tool-call syntax, max_tokens=%d", max_tokens)
 
         if temperature > 0 and request.seed is not None:
             seed = request.seed
@@ -270,49 +310,43 @@ class Engine:
         else:
             seed = int(time.time() * 1000) % (2**31)
 
-        max_tokens = request.max_tokens if request.max_tokens is not None else gen_cfg.max_tokens
-        stop = request.stop if request.stop else None
-
-        if force_greedy:
-            _log.debug("Tool-calling: using manual loop with per-token temp=0 for syntax")
-
-        try:
-            result = self._llm.create_chat_completion(
-                messages=request.messages,
-                tools=request.tools,
-                tool_choice=tool_choice,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                max_tokens=1,
-                stop=stop if stop else None,
-                stream=False,
-                seed=seed,
-                repeat_penalty=sampling.default_repeat_penalty,
-            )
-        except Exception as exc:
-            _log.error("Manual stream prefill failed: %s", exc)
-            raise
+        result = self._llm.create_chat_completion(
+            messages=request.messages,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            max_tokens=1,
+            stream=False,
+            seed=seed,
+            repeat_penalty=self.config.sampling.default_repeat_penalty,
+            **chat_kwargs,
+        )
 
         first_content = ""
         if "choices" in result and result["choices"]:
-            msg = result["choices"][0].get("message", {})
-            first_content = msg.get("content", "")
-
-        if first_content:
-            yield result
+            first_content = result["choices"][0].get("message", {}).get("content", "")
 
         detector = ToolCallDetector()
         if first_content:
             detector.feed(first_content)
+            yield {
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": first_content},
+                    "finish_reason": None,
+                }]
+            }
 
         try:
             eos_token = self._llm.token_eos()
         except Exception:
             eos_token = -1
 
-        for _ in range(max_tokens - 1 if max_tokens > 1 else max_tokens):
+        remaining = max_tokens - 1 if max_tokens > 1 else 0
+        for _ in range(remaining):
             try:
                 if detector.is_in_tool_call():
                     next_token = self._llm.sample(temp=0.0, top_p=1.0, top_k=1)
@@ -347,11 +381,17 @@ class Engine:
                 _log.error("Eval failed: %s", exc)
                 break
 
-            chunk: dict[str, Any] = {
+            yield {
                 "choices": [{
                     "index": 0,
                     "delta": {"content": text},
                     "finish_reason": None,
                 }]
             }
-            yield chunk
+
+        try:
+            self._total_eval_tokens = self._llm.n_tokens
+        except Exception:
+            pass
+
+        _log.info("manual stream done: %d tokens in context", self._total_eval_tokens)

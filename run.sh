@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODEL_DIR="${QUENSTAR_MODEL_DIR:-$SCRIPT_DIR/models}"
-KV_DIR="${QUENSTAR_KV_DIR:-$HOME/.quenstar/kv}"
-CTX="${QUENSTAR_CTX:-131072}"
+KV_DIR="${QUENSTAR_KV_DIR:-$SCRIPT_DIR/kvcache}"
+CTX="${QUENSTAR_CTX:-262144}"
 PORT="${QUENSTAR_PORT:-8080}"
 HOST="${HOST:-127.0.0.1}"
 KV_SPACE="${KV_SPACE:-8192}"
@@ -119,6 +119,33 @@ detect_mode() {
 
 detect_mode
 
+apply_mode() {
+    case "$1" in
+        desktop)
+            MODE="desktop"
+            [ -z "${QUENSTAR_CTX:-}" ] && CTX=262144
+            [ -z "${QUENSTAR_KV_SPACE:-}" ] && KV_SPACE=16384
+            MODEL_PREFIX="qwen3.6-35b-a3b-ud"
+            HF_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
+            MODEL_FAMILY="Qwen3.6-35B-A3B"
+            ;;
+        laptop)
+            MODE="laptop"
+            [ -z "${QUENSTAR_CTX:-}" ] && CTX=65536
+            [ -z "${QUENSTAR_KV_SPACE:-}" ] && KV_SPACE=8192
+            MODEL_PREFIX="qwen3-14b-instruct"
+            HF_REPO="unsloth/Qwen3-14B-Instruct-GGUF"
+            MODEL_FAMILY="Qwen3-14B-Instruct"
+            ;;
+        *)
+            warn "Unknown mode: $1. Using desktop."
+            apply_mode desktop
+            return
+            ;;
+    esac
+    info "Mode: $MODE (ctx=$CTX, kv_space=$KV_SPACE MB)"
+}
+
 apply_mode "${MODE:-desktop}"
 
 # ── helpers ────────────────────────────────────────────────────────
@@ -213,28 +240,51 @@ if $INSTALL_DEPS || [ ! -d "$VENV_DIR" ] || [ ! -f "$VENV_DIR/bin/activate" ]; t
     source "$VENV_DIR/bin/activate"
     step "Installing base dependencies..."
     pip install --upgrade pip -q
-    pip install fastapi "uvicorn[standard]" sse-starlette pyyaml -q
+    pip install fastapi "uvicorn[standard]" sse-starlette pyyaml cmake huggingface_hub -q
 
     if [ "$CUDA_INSTALL" = "1" ]; then
         cuda_dir="$(find_cuda_libdir || true)"
         if [ -n "$cuda_dir" ] || command -v nvidia-smi &>/dev/null; then
             [ -n "$cuda_dir" ] && info "CUDA libraries found at: $cuda_dir"
 
-            step "Installing llama-cpp-python with CUDA 12 support..."
-            if pip install llama-cpp-python \
-                --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
-                --force-reinstall --no-cache-dir -q 2>/dev/null; then
-                info "Installed llama-cpp-python (CUDA 12.4 pre-built)"
-            else
-                warn "Pre-built CUDA wheel failed. Trying source build..."
-                if command -v cmake &>/dev/null; then
-                    CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python \
-                        --force-reinstall --no-cache-dir -q
-                    info "Installed llama-cpp-python (CUDA source build)"
+            # Prefer source build with nvcc, skip if already installed and working
+            if command -v nvcc &>/dev/null; then
+                if python3 -c "import llama_cpp; llama_cpp.Llama" 2>/dev/null; then
+                    info "llama-cpp-python already installed, skipping rebuild"
                 else
-                    warn "cmake not found. Install cmake and try again, or use --cpu."
-                    pip install llama-cpp-python -q
-                    info "Installed llama-cpp-python (CPU only)"
+                    step "CUDA compiler found. Building llama-cpp-python from source..."
+                    if CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python \
+                        --force-reinstall --no-cache-dir 2>/dev/null; then
+                        info "Installed llama-cpp-python (CUDA source build)"
+                    else
+                        warn "Source build failed. Falling back to pre-built wheel..."
+                        pip install llama-cpp-python \
+                            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
+                            --force-reinstall --no-cache-dir -q 2>/dev/null || true
+                    fi
+                fi
+            else
+                if [ "$MODE" = "desktop" ]; then
+                    step "CUDA compiler (nvcc) not found. Required for vision/image support."
+                    warn "Install it manually, then re-run this script:"
+                    hint ""
+                    hint "  sudo apt install nvidia-cuda-toolkit    # Ubuntu/Debian"
+                    hint "  # then:"
+                    hint "  ./run.sh --install-deps"
+                    hint ""
+                fi
+                step "Installing llama-cpp-python (CUDA pre-built)..."
+                if pip install llama-cpp-python \
+                    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
+                    --force-reinstall --no-cache-dir -q 2>/dev/null; then
+                    info "Installed llama-cpp-python (CUDA 12.4 pre-built, no llava)"
+                else
+                    warn "Pre-built CUDA wheel failed. Trying source build..."
+                    CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python \
+                        --force-reinstall --no-cache-dir -q 2>/dev/null || {
+                        warn "Source build also failed. Installing CPU-only."
+                        pip install llama-cpp-python -q
+                    }
                 fi
             fi
         else
@@ -281,6 +331,9 @@ elif [ -z "$MODEL_PATH" ] || [ ! -f "$MODEL_PATH" ]; then
         "$MODEL_DIR"/*.gguf \
         "$SCRIPT_DIR"/*.gguf \
         ; do
+        case "$candidate" in
+            *mmproj*) continue ;;
+        esac
         if [ -f "$candidate" ] && verify_gguf "$candidate"; then
             local_model="$candidate"; break
         fi
@@ -405,6 +458,110 @@ verify_gguf "$MODEL_PATH" || {
     exit 1
 }
 
+# ── mmproj download (vision encoder) ─────────────────────────────────
+
+MMPROJ_PATH="${QUENSTAR_MMPROJ_PATH:-}"
+if [ "$MODE" = "desktop" ] && command -v nvcc &>/dev/null; then
+    MMPROJ_FILE="mmproj-F16.gguf"
+    MMPROJ_DIR="${QUENSTAR_MMPROJ_DIR:-$MODEL_DIR}"
+
+    if [ -z "$MMPROJ_PATH" ]; then
+        MMPROJ_PATH="$MMPROJ_DIR/$MMPROJ_FILE"
+    fi
+
+    if [ ! -f "$MMPROJ_PATH" ]; then
+        step "Downloading vision encoder (mmproj) for Qwen3.6..."
+        MMPROJ_URL="https://huggingface.co/${HF_REPO}/resolve/main/${MMPROJ_FILE}"
+        hint "Downloading $MMPROJ_FILE..."
+        if command -v curl &>/dev/null; then
+            curl -L --progress-bar -o "$MMPROJ_PATH" ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} "$MMPROJ_URL" 2>/dev/null || {
+                warn "mmproj download failed (file may not exist yet). Vision will be unavailable."
+                warn "Check ${HF_REPO} for available mmproj files."
+                MMPROJ_PATH=""
+            }
+        fi
+        if [ -f "$MMPROJ_PATH" ] && [ "$(stat -c%s "$MMPROJ_PATH" 2>/dev/null || echo 0)" -lt 1048576 ]; then
+            warn "mmproj download appears incomplete. Vision will be unavailable."
+            rm -f "$MMPROJ_PATH"
+            MMPROJ_PATH=""
+        fi
+    fi
+
+    if [ -n "$MMPROJ_PATH" ] && [ -f "$MMPROJ_PATH" ]; then
+        info "Vision encoder found: $MMPROJ_PATH"
+    fi
+fi
+
+# ── opencode auto-config ────────────────────────────────────────────
+
+OPCODE_CONFIG="${HOME}/.config/opencode/opencode.json"
+if [ "${OPCODE_AUTO_CONFIGURE:-1}" = "1" ]; then
+    if [ -f "$OPCODE_CONFIG" ]; then
+        ALREADY=$(python3 -c "
+import json
+with open('$OPCODE_CONFIG') as f:
+    cfg = json.load(f)
+has_prov = 'quenstar' in cfg.get('provider', {})
+has_ag = 'quenstar' in cfg.get('agent', {})
+if has_prov and has_ag:
+    print('yes')
+else:
+    print('no')
+" 2>/dev/null || echo "no")
+
+        INJECT="python3 -c \"
+import json, sys
+cfg_path = '\$OPCODE_CONFIG'
+with open(cfg_path) as f:
+    cfg = json.load(f)
+
+cfg.setdefault('provider', {})['quenstar'] = {
+    'name': 'QuenStar (local)',
+    'npm': '@ai-sdk/openai-compatible',
+    'options': {
+        'baseURL': 'http://${HOST}:${PORT}/v1',
+        'apiKey': 'local'
+    },
+    'models': {
+        'qwen3.6-35b': {
+            'name': 'Qwen3.6 35B (local)',
+            'limit': {'context': 1048576, 'output': 32768},
+            'modalities': {
+                'input': ['text', 'image'],
+                'output': ['text']
+            }
+        }
+    }
+}
+cfg.setdefault('agent', {})['quenstar'] = {
+    'description': 'Local QuenStar',
+    'model': 'quenstar/qwen3.6-35b',
+    'temperature': 0
+}
+with open(cfg_path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+\""
+
+        if [ "$ALREADY" = "yes" ]; then
+            hint "QuenStar already configured — updating opencode config"
+            eval "$INJECT" || warn "Failed to update opencode config"
+        else
+            echo ""
+            printf "${CYAN}==>${NC} Found opencode config at ${OPCODE_CONFIG}\n"
+            printf "    Add QuenStar as a provider and agent? [y/N] "
+            read -r reply < /dev/tty 2>/dev/null || reply=""
+            if [ "${reply,,}" = "y" ] || [ "${reply,,}" = "yes" ]; then
+                eval "$INJECT"
+                hint " -> QuenStar added to opencode config"
+            fi
+        fi
+    else
+        hint "opencode config not found at ${OPCODE_CONFIG} (install opencode first)"
+        hint "  Set OPCODE_AUTO_CONFIGURE=0 to skip this prompt"
+    fi
+fi
+
 # ── start server ───────────────────────────────────────────────────
 
 local_size="$(stat -c%s "$MODEL_PATH" 2>/dev/null || stat -f%z "$MODEL_PATH" 2>/dev/null || echo 0)"
@@ -425,5 +582,6 @@ exec python3 -m quenstar \
     --kv-dir "$KV_DIR" \
     --kv-space-mb "$KV_SPACE" \
     $OFFLOAD_KQV \
+    ${MMPROJ_PATH:+--mmproj "$MMPROJ_PATH"} \
     ${CORS:-} \
     ${TRACE:-}

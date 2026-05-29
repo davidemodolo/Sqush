@@ -15,17 +15,8 @@ def main():
         default=None,
         help="Path to config YAML file (default: config.yaml or ~/.config/quenstar/config.yaml)",
     )
-    parser.add_argument(
-        "-m", "--model",
-        default=None,
-        help="Path to GGUF model file (overrides config)",
-    )
-    parser.add_argument(
-        "--ctx",
-        type=int,
-        default=None,
-        help="Context window size in tokens (overrides config)",
-    )
+    from .config import add_shared_model_args
+    add_shared_model_args(parser)
     parser.add_argument(
         "--host",
         default=None,
@@ -47,12 +38,6 @@ def main():
         type=int,
         default=None,
         help="Max KV cache disk space in MB (overrides config)",
-    )
-    parser.add_argument(
-        "--no-offload-kqv",
-        action="store_true",
-        default=None,
-        help="Keep KV cache in system RAM instead of GPU VRAM",
     )
     parser.add_argument(
         "--trace",
@@ -78,17 +63,19 @@ def main():
         default=False,
         help="Run interactive CLI chat mode instead of server",
     )
+    parser.add_argument(
+        "--mmproj",
+        default=None,
+        help="Path to mmproj GGUF (vision encoder)",
+    )
 
     args = parser.parse_args()
 
-    from .config import QuenStarConfig
+    from .config import QuenStarConfig, apply_cli_overrides
 
     config = QuenStarConfig.load(args.config)
+    apply_cli_overrides(config, args)
 
-    if args.model:
-        config.model.path = args.model
-    if args.ctx:
-        config.model.n_ctx = args.ctx
     if args.host:
         config.server.host = args.host
     if args.port:
@@ -97,12 +84,12 @@ def main():
         config.kv_cache.dir = args.kv_dir
     if args.kv_space_mb:
         config.kv_cache.space_mb = args.kv_space_mb
-    if args.no_offload_kqv is not None:
-        config.model.offload_kqv = not args.no_offload_kqv
     if args.trace is not None:
         config.logging.trace = args.trace
     if args.cors:
         config.server.cors = True
+    if args.mmproj:
+        config.model.mmproj_path = args.mmproj
 
     log_level = logging.DEBUG if config.logging.trace else config.logging.level.upper()
     logging.basicConfig(
