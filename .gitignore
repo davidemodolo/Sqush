@@ -37,3 +37,5 @@ Thumbs.db
 
 # Config with secrets (copy from config.yaml and customize)
 config.local.yaml
+
+AGENTS.md

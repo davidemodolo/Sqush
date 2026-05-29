@@ -14,6 +14,7 @@ from .config import QuenStarConfig
 from .engine import Engine
 from .kvstore import KVCacheStore
 from .session import SessionManager
+from .toolcall import ToolCallRegistry, replay_tool_calls
 from .types import ChatCompletionRequest
 
 _log = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ def create_app(config: QuenStarConfig) -> FastAPI:
         n_ctx=config.model.n_ctx,
     )
     session = SessionManager(engine, kvstore, config)
+    registry = ToolCallRegistry(max_entries=config.tool_calling.exact_replay_cache_size)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -67,8 +69,59 @@ def create_app(config: QuenStarConfig) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        body = await request.json()
+        try:
+            return await _handle_chat(request, engine, session, registry, config)
+        except Exception as exc:
+            _log.error("Unhandled error in chat/completions: %s", exc, exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "message": str(exc),
+                        "type": "server_error",
+                        "code": "internal_error",
+                    }
+                },
+            )
+
+
+    async def _handle_chat(
+        request: Request,
+        engine: Engine,
+        session: SessionManager,
+        registry: ToolCallRegistry,
+        config: QuenStarConfig,
+    ):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "Invalid JSON body",
+                        "type": "invalid_request_error",
+                        "code": "invalid_json",
+                    }
+                },
+            )
+
+        raw_messages = body.get("messages", [])
+        replayed_messages = replay_tool_calls(raw_messages, registry)
+        body["messages"] = replayed_messages
         req = ChatCompletionRequest.from_dict(body)
+
+        if not req.messages:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "`messages` is required",
+                        "type": "invalid_request_error",
+                        "code": "missing_messages",
+                    }
+                },
+            )
 
         _log.info(
             "chat/completions: model=%s stream=%s msgs=%d tools=%d temp=%s",
@@ -85,7 +138,7 @@ def create_app(config: QuenStarConfig) -> FastAPI:
 
         if req.stream:
             return EventSourceResponse(
-                _stream_chat(engine, session, req),
+                _stream_chat(engine, session, req, registry),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -94,7 +147,7 @@ def create_app(config: QuenStarConfig) -> FastAPI:
                 },
             )
         else:
-            return await _non_stream_chat(engine, session, req)
+            return await _non_stream_chat(engine, session, req, registry)
 
     @app.get("/health")
     async def health():
@@ -110,6 +163,15 @@ def create_app(config: QuenStarConfig) -> FastAPI:
             "session_id": session.session_id,
             "session_resumed": session.is_resumed,
         }
+
+    @app.get("/health/vram")
+    async def health_vram():
+        info = _query_gpu_vram()
+        info["model_path"] = engine.model_path
+        info["n_ctx"] = config.model.n_ctx
+        info["offload_kqv"] = config.model.offload_kqv
+        info["n_gpu_layers"] = config.model.n_gpu_layers
+        return info
 
     @app.get("/sessions")
     async def list_sessions():
@@ -133,8 +195,14 @@ async def _non_stream_chat(
     engine: Engine,
     session: SessionManager,
     request: ChatCompletionRequest,
+    registry: ToolCallRegistry,
 ) -> dict[str, Any]:
-    chunks = list(engine.chat_completion(request))
+    try:
+        chunks = list(engine.chat_completion(request))
+    except Exception as exc:
+        _log.error("Non-stream inference failed: %s", exc)
+        raise
+
     if not chunks:
         return _empty_response(engine.model_id)
 
@@ -161,6 +229,7 @@ async def _non_stream_chat(
     if tool_calls:
         assistant_msg["tool_calls"] = tool_calls
         assistant_msg["content"] = None
+        _register_tool_content(registry, tool_calls, content)
 
     session.update(request.messages + [assistant_msg])
     session.save_checkpoint()
@@ -185,6 +254,7 @@ async def _stream_chat(
     engine: Engine,
     session: SessionManager,
     request: ChatCompletionRequest,
+    registry: ToolCallRegistry,
 ) -> AsyncIterator[dict[str, Any]]:
     accumulated_content = ""
     accumulated_tool_calls: list[dict[str, Any]] = []
@@ -227,10 +297,16 @@ async def _stream_chat(
             "choices": [
                 {
                     "index": 0,
-                    "delta": {},
+                    "delta": {
+                        "content": f"[ERROR: {exc}]",
+                    },
                     "finish_reason": "error",
                 }
             ],
+            "error": {
+                "message": str(exc),
+                "type": "server_error",
+            },
         })}
 
     assistant_msg: dict[str, Any] = {
@@ -240,6 +316,7 @@ async def _stream_chat(
     if accumulated_tool_calls:
         assistant_msg["tool_calls"] = accumulated_tool_calls
         assistant_msg["content"] = None
+        _register_tool_content(registry, accumulated_tool_calls, accumulated_content)
 
     session.update(request.messages + [assistant_msg])
     session.save_checkpoint()
@@ -288,6 +365,54 @@ def _gen_id(prefix: str = "", length: int = 29) -> str:
 
     chars = string.ascii_letters + string.digits
     return prefix + "".join(random.choices(chars, k=length))
+
+
+def _query_gpu_vram() -> dict[str, Any]:
+    import subprocess
+
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return {"error": "nvidia-smi not available"}
+
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 6:
+            try:
+                idx, name, total, used, free, util = parts
+                total_mb = int(total)
+                used_mb = int(used)
+                free_mb = int(free)
+                gpus.append({
+                    "index": int(idx),
+                    "name": name,
+                    "memory_total_mb": total_mb,
+                    "memory_used_mb": used_mb,
+                    "memory_free_mb": free_mb,
+                    "utilization_pct": int(util) if util != "[Not Supported]" else -1,
+                })
+            except (ValueError, IndexError):
+                pass
+
+    return {"gpus": gpus}
+
+
+def _register_tool_content(registry, tool_calls, raw_content):
+    if not tool_calls or not raw_content:
+        return
+    for tc in tool_calls:
+        tc_id = tc.get("id", "")
+        if tc_id:
+            registry.register(tc_id, raw_content)
 
 
 def run_server(config: QuenStarConfig):
