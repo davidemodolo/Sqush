@@ -124,16 +124,31 @@ class ToolCallDetector:
 class ToolCallRegistry:
     def __init__(self, max_entries: int = 100000):
         self._registry: dict[str, str] = {}
+        self._raw_content: dict[str, str] = {}
         self._max_entries = max_entries
 
     def register(self, tool_id: str, raw_text: str):
         self._registry[tool_id] = raw_text
-        if len(self._registry) > self._max_entries:
-            oldest = next(iter(self._registry))
-            del self._registry[oldest]
+        self._trim()
+
+    def register_content(self, key: str, raw_content: str):
+        self._raw_content[key] = raw_content
+        self._trim()
 
     def lookup(self, tool_id: str) -> Optional[str]:
         return self._registry.get(tool_id)
+
+    def lookup_content(self, key: str) -> Optional[str]:
+        return self._raw_content.get(key)
+
+    def _trim(self):
+        while len(self._registry) + len(self._raw_content) > self._max_entries:
+            if self._raw_content:
+                self._raw_content.pop(next(iter(self._raw_content)))
+            elif self._registry:
+                self._registry.pop(next(iter(self._registry)))
+            else:
+                break
 
 
 def extract_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
@@ -156,3 +171,52 @@ def extract_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             pass
     return calls
+
+
+def replay_tool_calls(
+    messages: list[dict[str, Any]],
+    registry: ToolCallRegistry,
+) -> list[dict[str, Any]]:
+    if not registry:
+        return messages
+
+    result = []
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tool_calls = msg["tool_calls"]
+            if tool_calls:
+                first_id = tool_calls[0].get("id", "")
+                raw = registry.lookup(first_id)
+                if raw:
+                    result.append({"role": "assistant", "content": raw})
+                    continue
+                canonical = canonicalize_tool_calls(tool_calls)
+                if canonical:
+                    result.append({"role": "assistant", "content": canonical})
+                    continue
+        result.append(msg)
+    return result
+
+
+def canonicalize_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
+    parts = []
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        try:
+            args = json.loads(fn.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        canonical = json.dumps(
+            {"name": name, "arguments": args},
+            separators=(",", ":"),
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        parts.append(f"<tool_call>\n{canonical}\n</tool_call>")
+    return "\n".join(parts)
