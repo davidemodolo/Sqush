@@ -1,50 +1,29 @@
+# QuenStar v2 — Qwen3.6-27B quantized inference
 model:
-  path: "./models/qwen3.6-35b-a3b-ud-q4_k_m.gguf"
-  n_gpu_layers: -1
-  n_ctx: 262144
-  n_batch: 2048
-  n_ubatch: 256
-  offload_kqv: false
-  flash_attn: true
-  use_mmap: true
-  type_k: 7   # q8_0
-  type_v: 7
-  yarn_ext_factor: 4.0
-  yarn_attn_factor: 1.0
-  yarn_beta_fast: 32.0
-  yarn_beta_slow: 1.0
+  repo: "Qwen/Qwen3.6-27B"
+  cache_dir: "./models"
+  torch_dtype: "bfloat16"
+  attn_implementation: "sdpa"
+  # load_in_4bit/8bit are handled via torchao post-load quantization
+
+quantization:
+  weight_bits: 4          # 4 = bitsandbytes NF4; 2/3 need offline quantized model
+  kv_cache_bits: 4        # KV cache quantization bits
+  turbo: true             # use torchao's optimized kernels
+  # hybrid expert quantization (for MoE models, ignored for dense)
+  hybrid: false
+
+inference:
+  max_context: 262144     # full 262k — fits with 4-bit KV cache (~4.3 GB) + 4-bit weights (~16.5 GB) = ~21 GB
+  max_new_tokens: 32768
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  presence_penalty: 1.5
 
 server:
   host: "127.0.0.1"
-  port: 8080
-  cors: false
-
-kv_cache:
-  dir: "./kvcache"
-  space_mb: 8192
-  eviction_half_life_hours: 6.0
-
-sampling:
-  default_temperature: 0.8
-  default_top_p: 0.9
-  default_top_k: 40
-  default_min_p: 0.05
-  default_repeat_penalty: 1.0
-  tool_call_temperature: 0.0
-  tool_call_top_p: 1.0
-  tool_call_top_k: 1
-
-generation:
-  max_tokens: 32768
-  stop_strings: []
-
-tool_calling:
-  enabled: true
-  exact_replay_cache_size: 100000
-  manual_token_loop: false
-  greedy_tool_syntax: true
-  payload_temperature: 0.7
+  port: 9898
 
 logging:
   level: "INFO"
-  trace: false

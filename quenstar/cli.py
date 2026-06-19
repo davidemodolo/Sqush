@@ -1,204 +1,71 @@
-#!/usr/bin/env python3
-"""CLI test tool: load model via Engine, run one-shot prompt or interactive chat."""
 from __future__ import annotations
 
-import argparse
-import shutil
+import logging
 import sys
-import time
+from typing import Optional
 
-from .config import QuenStarConfig, apply_cli_overrides
-from .engine import Engine
-from .types import ChatCompletionRequest
+from .config import QuenStarConfig
+from .engine import InferenceEngine
 
-
-def main():
-    args = _parse_args()
-    config = _build_config(args)
-    engine = Engine(config)
-
-    if args.interactive:
-        _run_interactive(engine, args.system)
-    else:
-        _run_one_shot(engine, args.prompt)
+log = logging.getLogger(__name__)
 
 
-def run_interactive_chat(config: QuenStarConfig, system_prompt: str | None = None):
-    engine = Engine(config)
-    _chat_loop(engine, system_prompt)
+def run_cli(engine: InferenceEngine, config: QuenStarConfig):
+    from rich.console import Console
+    from rich.markdown import Markdown
 
+    console = Console()
+    messages: list[dict[str, str]] = []
 
-def _parse_args():
-    parser = argparse.ArgumentParser(description="QuenStar CLI — test model inference")
-    from .config import add_shared_model_args
-    add_shared_model_args(parser)
-    parser.add_argument("-i", "--interactive", action="store_true", help="Interactive chat mode")
-    parser.add_argument("-s", "--system", default=None, help="System prompt (interactive mode)")
-    parser.add_argument("-p", "--prompt", default="Say hello in one sentence.")
-    args = parser.parse_args()
-    if not args.model:
-        parser.error("-m/--model is required")
-    return args
+    console.print("[bold cyan]QuenStar[/] v2.0 — [dim]Qwen3.6-27B quantized[/]")
+    console.print(f"  weight bits: {config.quantization.weight_bits}")
+    console.print(f"  KV cache bits: {config.quantization.kv_cache_bits}")
+    console.print(f"  max context: {config.inference.max_context}")
+    vram = engine.get_vram_info()
+    if vram["cuda_available"]:
+        console.print(f"  VRAM: {vram['allocated_gb']:.1f}/{vram['total_gb']:.0f} GB allocated")
+    console.print()
+    console.print("  Commands: [bold]/quit[/], [bold]/clear[/], [bold]/system <msg>[/], [bold]/vram[/]")
+    console.print()
 
+    while True:
+        try:
+            user_input = console.input("[bold green]>>>[/] ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\nGoodbye!")
+            break
 
-def _build_config(args):
-    config = QuenStarConfig.load()
-    apply_cli_overrides(config, args)
-    return config
+        user_input = user_input.strip()
+        if not user_input:
+            continue
 
+        if user_input == "/quit":
+            break
+        elif user_input == "/clear":
+            messages = []
+            console.print("[dim]Conversation cleared.[/]")
+            continue
+        elif user_input == "/vram":
+            vram = engine.get_vram_info()
+            if vram["cuda_available"]:
+                console.print(f"  VRAM: {vram['allocated_gb']:.1f} GB allocated / {vram['total_gb']:.0f} GB total")
+            continue
+        elif user_input.startswith("/system "):
+            system_text = user_input[8:]
+            messages = [m for m in messages if m["role"] != "system"]
+            messages.insert(0, {"role": "system", "content": system_text})
+            console.print(f"[dim]System prompt set.[/]")
+            continue
 
-def _run_one_shot(engine, prompt):
-    request = ChatCompletionRequest(
-        messages=[{"role": "user", "content": prompt}],
-        stream=True,
-    )
+        messages.append({"role": "user", "content": user_input})
 
-    print(f"User: {prompt}")
-    print("Assistant: ", end="", flush=True)
+        console.print()
+        response_text = ""
+        for token in engine.chat_completion_stream(messages):
+            response_text += token
+            console.print(token, end="")
+        console.print()
+        console.print()
 
-    t0 = time.time()
-    first_token = True
-    total_tokens = 0
-    ttft = 0.0
-
-    try:
-        for chunk in engine.chat_completion(request):
-            choices = chunk.get("choices", [])
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {})
-            text = delta.get("content", "")
-            if not text:
-                continue
-            if first_token:
-                ttft = time.time() - t0
-                first_token = False
-            print(text, end="", flush=True)
-            total_tokens += 1
-    except Exception as exc:
-        print(f"\nERROR during inference: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    total_time = time.time() - t0
-    print()
-    print()
-    print("---")
-    print(f"  tokens: {total_tokens}")
-    print(f"  ttft: {ttft:.2f}s")
-    print(f"  total: {total_time:.2f}s")
-    if total_tokens > 1:
-        print(f"  tok/s: {(total_tokens - 1) / (total_time - ttft):.1f}")
-
-
-def _run_interactive(engine, system_prompt=None):
-    _chat_loop(engine, system_prompt)
-
-
-def _chat_loop(engine, system_prompt=None):
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-
-    terminal_width = shutil.get_terminal_size().columns
-    separator = "\u2500" * terminal_width
-
-    print("Interactive chat mode. Type your message and press Enter.")
-    print("Commands: /quit, /exit, /clear, /system <prompt>")
-    print(separator)
-
-    try:
-        while True:
-            try:
-                user_input = input("\nYou: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nGoodbye!")
-                break
-
-            if not user_input:
-                continue
-
-            if user_input.startswith("/"):
-                messages = _handle_command(user_input, messages)
-                continue
-
-            messages.append({"role": "user", "content": user_input})
-
-            print("Assistant: ", end="", flush=True)
-            t0 = time.time()
-            first_token = True
-            total_tokens = 0
-            ttft = 0.0
-            full_response = ""
-
-            try:
-                request = ChatCompletionRequest(
-                    messages=list(messages),
-                    stream=True,
-                )
-                for chunk in engine.chat_completion(request):
-                    try:
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta", {})
-                        text = delta.get("content", "")
-                        if not text:
-                            continue
-                        if first_token:
-                            ttft = time.time() - t0
-                            first_token = False
-                        print(text, end="", flush=True)
-                        full_response += text
-                        total_tokens += 1
-                    except KeyboardInterrupt:
-                        break
-            except KeyboardInterrupt:
-                engine.reset_context()
-                full_response = ""
-            except Exception as exc:
-                print(f"\nERROR during inference: {exc}", file=sys.stderr)
-                continue
-
-            total_time = time.time() - t0
-            print()
-
-            if full_response:
-                messages.append({"role": "assistant", "content": full_response})
-
-            tok_s = (total_tokens - 1) / (total_time - ttft) if total_tokens > 1 else 0
-            print(f"  [{total_tokens} tok, ttft {ttft:.1f}s, {tok_s:.0f} tok/s]")
-
-    except KeyboardInterrupt:
-        print("\nGoodbye!")
-
-
-def _handle_command(cmd, messages):
-    parts = cmd.split(maxsplit=1)
-    command = parts[0].lower()
-
-    if command in ("/quit", "/exit", "/q"):
-        print("Goodbye!")
-        sys.exit(0)
-
-    elif command == "/clear":
-        messages[:] = [m for m in messages if m["role"] == "system"]
-        print("[Conversation cleared (system prompt kept)]")
-
-    elif command == "/system":
-        if len(parts) > 1:
-            new_system = parts[1]
-            messages[:] = [m for m in messages if m["role"] != "system"]
-            messages.insert(0, {"role": "system", "content": new_system})
-            truncated = new_system[:80] + "..." if len(new_system) > 80 else new_system
-            print(f"[System prompt set: {truncated}]")
-        else:
-            print("[Usage: /system <prompt>]")
-
-    else:
-        print(f"[Unknown command: {command}]")
-
-    return messages
-
-
-if __name__ == "__main__":
-    main()
+        if response_text.strip():
+            messages.append({"role": "assistant", "content": response_text})

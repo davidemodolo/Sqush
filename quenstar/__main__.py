@@ -1,3 +1,12 @@
+"""QuenStar v2 — Qwen3.6-27B quantized inference server.
+
+Usage:
+    python -m quenstar download           # Download the model
+    python -m quenstar serve              # Start OpenAI-compatible server
+    python -m quenstar chat               # Interactive chat
+    python -m quenstar info               # Show config and VRAM info
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -6,116 +15,89 @@ import sys
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="QuenStar - Local LLM inference server with disk KV cache",
-        prog="quenstar",
-    )
-    parser.add_argument(
-        "-c", "--config",
-        default=None,
-        help="Path to config YAML file (default: config.yaml or ~/.config/quenstar/config.yaml)",
-    )
-    from .config import add_shared_model_args
-    add_shared_model_args(parser)
-    parser.add_argument(
-        "--host",
-        default=None,
-        help="Server host (overrides config)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="Server port (overrides config)",
-    )
-    parser.add_argument(
-        "--kv-dir",
-        default=None,
-        help="KV cache directory (overrides config)",
-    )
-    parser.add_argument(
-        "--kv-space-mb",
-        type=int,
-        default=None,
-        help="Max KV cache disk space in MB (overrides config)",
-    )
-    parser.add_argument(
-        "--trace",
-        action="store_true",
-        default=None,
-        help="Enable trace logging for debugging",
-    )
-    parser.add_argument(
-        "--cors",
-        action="store_true",
-        default=None,
-        help="Enable CORS headers",
-    )
-    parser.add_argument(
-        "--cli",
-        action="store_true",
-        default=False,
-        help="Run quick CLI inference test instead of server",
-    )
-    parser.add_argument(
-        "--chat",
-        action="store_true",
-        default=False,
-        help="Run interactive CLI chat mode instead of server",
-    )
-    parser.add_argument(
-        "--mmproj",
-        default=None,
-        help="Path to mmproj GGUF (vision encoder)",
-    )
+    parser = argparse.ArgumentParser(description="QuenStar v2 — Qwen3.6-27B quantized inference")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("download", help="Download the model from HuggingFace")
+    sub.add_parser("serve", help="Start the OpenAI-compatible server")
+    sub.add_parser("chat", help="Start interactive chat")
+    sub.add_parser("info", help="Show configuration")
+
+    parser.add_argument("--config", default="config.yaml", help="Path to config file")
+    parser.add_argument("--log-level", default=None, help="Logging level")
 
     args = parser.parse_args()
 
-    from .config import QuenStarConfig, apply_cli_overrides
+    from .config import load_config
+    config = load_config(args.config)
 
-    config = QuenStarConfig.load(args.config)
-    apply_cli_overrides(config, args)
-
-    if args.host:
-        config.server.host = args.host
-    if args.port:
-        config.server.port = args.port
-    if args.kv_dir:
-        config.kv_cache.dir = args.kv_dir
-    if args.kv_space_mb:
-        config.kv_cache.space_mb = args.kv_space_mb
-    if args.trace is not None:
-        config.logging.trace = args.trace
-    if args.cors:
-        config.server.cors = True
-    if args.mmproj:
-        config.model.mmproj_path = args.mmproj
-
-    log_level = logging.DEBUG if config.logging.trace else config.logging.level.upper()
+    log_level = (args.log_level or config.logging.level).upper()
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+        format="%(levelname)s %(asctime)s %(name)s — %(message)s",
     )
+    # Suppress known-harmless upstream warnings
+    logging.getLogger("transformers.models.qwen3_5.modeling_qwen3_5").setLevel(logging.ERROR)
+    logging.getLogger("torch.utils._pytree").setLevel(logging.ERROR)
 
-    if not config.model.path:
-        print("Error: No model path specified. Use -m/--model or set QUENSTAR_MODEL_PATH.", file=sys.stderr)
-        sys.exit(1)
+    if args.command == "download":
+        from .download import download_model
+        download_model(config.model.repo, config.model.cache_dir)
 
-    if args.cli:
-        from .cli import main as cli_main
-        sys.argv = ["quenstar-cli", "-m", config.model.path]
-        cli_main()
-        return
+    elif args.command == "info":
+        print(f"Model: {config.model.repo}")
+        print(f"Cache dir: {config.model.cache_dir}")
+        print(f"Attn: {config.model.attn_implementation}")
+        print(f"Torch dtype: {config.model.torch_dtype}")
+        print(f"Weight bits: {config.quantization.weight_bits}")
+        print(f"KV cache bits: {config.quantization.kv_cache_bits}")
+        print(f"Max context: {config.inference.max_context}")
+        print(f"Server: {config.server.host}:{config.server.port}")
 
-    if args.chat:
-        from .cli import run_interactive_chat
-        run_interactive_chat(config)
-        return
+    elif args.command in ("serve", "chat"):
+        from .download import download_model
+        model_path = download_model(config.model.repo, config.model.cache_dir)
 
-    from .server import run_server
+        from .quantize import load_and_quantize_model
+        model, tokenizer, cache_config = load_and_quantize_model(
+            model_path=model_path,
+            weight_bits=config.quantization.weight_bits,
+            kv_cache_bits=config.quantization.kv_cache_bits,
+            turbo=config.quantization.turbo,
+            attn_implementation=config.model.attn_implementation,
+            torch_dtype_str=config.model.torch_dtype,
+        )
 
-    run_server(config)
+        from .engine import InferenceEngine
+        engine = InferenceEngine(
+            model=model,
+            tokenizer=tokenizer,
+            cache_config=cache_config,
+            max_context=config.inference.max_context,
+            max_new_tokens=config.inference.max_new_tokens,
+            temperature=config.inference.temperature,
+            top_p=config.inference.top_p,
+            top_k=config.inference.top_k,
+            presence_penalty=config.inference.presence_penalty,
+        )
+
+        if args.command == "serve":
+            from .server import create_app
+            import uvicorn
+
+            app = create_app(engine, config)
+            uvicorn.run(
+                app,
+                host=config.server.host,
+                port=config.server.port,
+                log_level=config.logging.level.lower(),
+            )
+        elif args.command == "chat":
+            from .cli import run_cli
+            run_cli(engine, config)
+
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":
