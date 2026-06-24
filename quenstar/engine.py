@@ -59,15 +59,20 @@ class InferenceEngine:
         self.top_k = top_k
         self.presence_penalty = presence_penalty
         self._last_prompt_tokens = 0
+        self._session_kv = None
+        self._session_prompt_ids = None
 
-    def _chunked_prefill(self, input_ids: torch.Tensor) -> tuple[object, torch.Tensor]:
+    def _chunked_prefill(self, input_ids: torch.Tensor,
+                         cache: object = None) -> tuple[object, torch.Tensor]:
         """Prefill long prompts in chunks to bound the fla linear-attention transient.
 
         Prefills all but the last token; generate() handles the last token + decode.
+        If *cache* is given, prefill appends to it instead of creating a fresh cache.
         Returns (cache, input_ids) — pass both to generate().
         """
         total_len = input_ids.shape[1]
-        cache = self.cache_factory() if self.cache_factory is not None else None
+        if cache is None and self.cache_factory is not None:
+            cache = self.cache_factory()
 
         offset = 0
         while offset < total_len - 1:
@@ -91,10 +96,10 @@ class InferenceEngine:
     def _prepare_generation(self, input_ids: torch.Tensor, max_tokens: Optional[int] = None) -> tuple[dict, torch.Tensor]:
         """Build generate kwargs and determine the input for generate().
 
-        For long prompts (>PREFILL_CHUNK), does chunked prefill first.
+        Reuses the session KV cache when the new prompt extends a previous one
+        (messages appended, not edited). Falls back to full prefill otherwise.
         Returns (generate_kwargs, generate_input_ids).
         """
-        total_len = input_ids.shape[1]
         kwargs = {
             "max_new_tokens": max_tokens if max_tokens is not None else self.max_new_tokens,
             "temperature": self.temperature,
@@ -105,15 +110,29 @@ class InferenceEngine:
             "eos_token_id": self.tokenizer.eos_token_id,
         }
 
-        if total_len > PREFILL_CHUNK:
-            cache, _ = self._chunked_prefill(input_ids)
-            kwargs["past_key_values"] = cache
-            self._prefilled = True
-        else:
-            if self.cache_factory is not None:
-                kwargs["past_key_values"] = self.cache_factory()
-            self._prefilled = False
+        total_len = input_ids.shape[1]
 
+        if self._session_kv is not None and self._session_prompt_ids is not None:
+            prompt_len = self._session_prompt_ids.shape[1]
+            if total_len > prompt_len and torch.equal(input_ids[:, :prompt_len], self._session_prompt_ids):
+                cache_seq_len = getattr(self._session_kv, "get_seq_length", lambda _: 0)(0)
+                if total_len > cache_seq_len:
+                    new_tokens = input_ids[:, cache_seq_len:]
+                    if new_tokens.shape[1] > 1:
+                        self._session_kv, _ = self._chunked_prefill(new_tokens, cache=self._session_kv)
+                    kwargs["past_key_values"] = self._session_kv
+                    self._session_prompt_ids = input_ids
+                    return kwargs, input_ids
+
+        if total_len > PREFILL_CHUNK:
+            self._session_kv, _ = self._chunked_prefill(input_ids)
+            kwargs["past_key_values"] = self._session_kv
+        else:
+            self._session_kv = self.cache_factory() if self.cache_factory is not None else None
+            if self._session_kv is not None:
+                kwargs["past_key_values"] = self._session_kv
+
+        self._session_prompt_ids = input_ids
         return kwargs, input_ids
 
     def _tokenize(self, messages: list[dict[str, str]], enable_thinking: bool = True,
@@ -146,6 +165,11 @@ class InferenceEngine:
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         n_tokens = len(generated_ids)
         log.info(f"Generated {n_tokens} tokens in {elapsed:.2f}s ({n_tokens / elapsed:.1f} tok/s)")
+
+        if "past_key_values" in kwargs:
+            self._session_kv = kwargs["past_key_values"]
+        self._session_prompt_ids = outputs[0].unsqueeze(0)
+
         return text, input_ids.shape[1], n_tokens
 
     def chat_completion_stream(
@@ -177,6 +201,13 @@ class InferenceEngine:
             yield text
 
         thread.join()
+
+        if "past_key_values" in kwargs:
+            self._session_kv = kwargs["past_key_values"]
+
+    def reset_session(self) -> None:
+        self._session_kv = None
+        self._session_prompt_ids = None
 
     def get_vram_info(self) -> dict:
         if not torch.cuda.is_available():
