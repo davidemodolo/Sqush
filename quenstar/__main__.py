@@ -20,6 +20,26 @@ def _opencode_config_path() -> str:
     return os.path.expanduser("~/.config/opencode/opencode.json")
 
 
+def _warmup_engine(engine) -> None:
+    """Run a dummy generation to autotune all triton kernels before serving.
+
+    The first triton kernel invocation triggers autotuning (benchmark loop),
+    which sets/clears self.nargs on the shared autotuner object. Concurrent
+    requests during autotuning cause a race where one thread resets nargs
+    to None while another thread's _bench is still reading it. Pre-warming
+    populates the in-memory kernel cache so subsequent calls skip autotuning.
+    """
+    log = logging.getLogger(__name__)
+    log.info("Warming up model (autotuning triton kernels) …")
+
+    warmup_messages = [{"role": "user", "content": "1+1="}]
+    try:
+        text, _, _ = engine.chat_completion_sync(warmup_messages, max_tokens=8, enable_thinking=False)
+        log.info("Warmup complete: %r", text[:120])
+    except Exception as exc:
+        log.warning("Warmup failed (non-fatal): %s", exc)
+
+
 def _init_opencode(config) -> None:
     config_path = _opencode_config_path()
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
@@ -145,6 +165,8 @@ def main():
         )
 
         if args.command == "serve":
+            _warmup_engine(engine)
+
             from .server import create_app
             import uvicorn
 
