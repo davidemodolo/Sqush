@@ -3,7 +3,7 @@ model:
   repo: "Qwen/Qwen3.6-27B"
   cache_dir: "./models"
   torch_dtype: "bfloat16"
-  attn_implementation: "sdpa"
+  attn_implementation: "sdpa"   # load-time value; quantize.py overrides to "quenstar" (blockwise GQA) post-load. See PROGRESS.md.
   # 4-bit weights via bitsandbytes NF4 quantization
 
 quantization:
@@ -11,7 +11,7 @@ quantization:
   kv_cache_bits: 4        # KV cache quantization bits
 
 inference:
-  max_context: 262144     # full 262k — fits with 4-bit KV cache (~4.3 GB) + 4-bit weights (~16.5 GB) = ~21 GB
+  max_context: 262144     # full 256k — verified ~21.1 GB peak (4-bit KV ~4.3GB + 4-bit weights ~16.4GB + blockwise transient)
   max_new_tokens: 65536
   temperature: 0.7
   top_p: 0.8

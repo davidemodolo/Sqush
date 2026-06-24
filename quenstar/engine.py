@@ -8,6 +8,8 @@ import torch
 
 log = logging.getLogger(__name__)
 
+PREFILL_CHUNK = 1024
+
 
 def _safe_messages(messages: list[dict]) -> list[dict]:
     """Preprocess messages: Qwen3.6 template expects tool_call.arguments as dict,
@@ -58,9 +60,43 @@ class InferenceEngine:
         self.presence_penalty = presence_penalty
         self._last_prompt_tokens = 0
 
-    def _build_generate_kwargs(self) -> dict:
+    def _chunked_prefill(self, input_ids: torch.Tensor) -> tuple[object, torch.Tensor]:
+        """Prefill long prompts in chunks to bound the fla linear-attention transient.
+
+        Prefills all but the last token; generate() handles the last token + decode.
+        Returns (cache, input_ids) — pass both to generate().
+        """
+        total_len = input_ids.shape[1]
+        cache = self.cache_factory() if self.cache_factory is not None else None
+
+        offset = 0
+        while offset < total_len - 1:
+            end = min(offset + PREFILL_CHUNK, total_len - 1)
+            chunk = input_ids[:, offset:end]
+            with torch.no_grad():
+                out = self.model(
+                    input_ids=chunk,
+                    past_key_values=cache,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+            cache = out.past_key_values
+            offset = end
+            if torch.cuda.is_available():
+                alloc = torch.cuda.memory_allocated() / (1024**3)
+                log.info(f"prefill {offset}/{total_len} tokens, VRAM={alloc:.1f} GB")
+
+        return cache, input_ids
+
+    def _prepare_generation(self, input_ids: torch.Tensor, max_tokens: Optional[int] = None) -> tuple[dict, torch.Tensor]:
+        """Build generate kwargs and determine the input for generate().
+
+        For long prompts (>PREFILL_CHUNK), does chunked prefill first.
+        Returns (generate_kwargs, generate_input_ids).
+        """
+        total_len = input_ids.shape[1]
         kwargs = {
-            "max_new_tokens": self.max_new_tokens,
+            "max_new_tokens": max_tokens if max_tokens is not None else self.max_new_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
@@ -68,9 +104,17 @@ class InferenceEngine:
             "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
-        if self.cache_factory is not None:
-            kwargs["past_key_values"] = self.cache_factory()
-        return kwargs
+
+        if total_len > PREFILL_CHUNK:
+            cache, _ = self._chunked_prefill(input_ids)
+            kwargs["past_key_values"] = cache
+            self._prefilled = True
+        else:
+            if self.cache_factory is not None:
+                kwargs["past_key_values"] = self.cache_factory()
+            self._prefilled = False
+
+        return kwargs, input_ids
 
     def _tokenize(self, messages: list[dict[str, str]], enable_thinking: bool = True,
                    tools: Optional[list] = None) -> torch.Tensor:
@@ -90,16 +134,15 @@ class InferenceEngine:
         tools: Optional[list] = None,
     ) -> tuple[str, int, int]:
         input_ids = self._tokenize(messages, enable_thinking=enable_thinking, tools=tools)
-        kwargs = self._build_generate_kwargs()
-        if max_tokens is not None:
-            kwargs["max_new_tokens"] = max_tokens
+        kwargs, generate_input = self._prepare_generation(input_ids, max_tokens)
 
         t0 = time.perf_counter()
         with torch.no_grad():
-            outputs = self.model.generate(input_ids, **kwargs)
+            outputs = self.model.generate(generate_input, **kwargs)
         elapsed = time.perf_counter() - t0
 
-        generated_ids = outputs[0][input_ids.shape[1]:]
+        n_input = input_ids.shape[1]
+        generated_ids = outputs[0][n_input:]
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         n_tokens = len(generated_ids)
         log.info(f"Generated {n_tokens} tokens in {elapsed:.2f}s ({n_tokens / elapsed:.1f} tok/s)")
@@ -118,9 +161,7 @@ class InferenceEngine:
 
         input_ids = self._tokenize(messages, enable_thinking=enable_thinking, tools=tools)
         self._last_prompt_tokens = input_ids.shape[1]
-        kwargs = self._build_generate_kwargs()
-        if max_tokens is not None:
-            kwargs["max_new_tokens"] = max_tokens
+        kwargs, generate_input = self._prepare_generation(input_ids, max_tokens)
 
         streamer = TextIteratorStreamer(
             self.tokenizer,
@@ -129,7 +170,7 @@ class InferenceEngine:
         )
         kwargs["streamer"] = streamer
 
-        thread = Thread(target=self.model.generate, kwargs={**kwargs, "inputs": input_ids})
+        thread = Thread(target=self.model.generate, kwargs={**kwargs, "inputs": generate_input})
         thread.start()
 
         for text in streamer:
