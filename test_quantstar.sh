@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_quenstar.sh — End-to-end test suite for QuenStar inference
+# test_quantstar.sh — End-to-end test suite for QuantStar inference
 # Tests: server startup, single request, streaming, concurrent requests
 set -euo pipefail
 
@@ -11,7 +11,7 @@ NC='\033[0m'
 PASS=0
 FAIL=0
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SERVER_LOG="/tmp/quenstar_test.log"
+SERVER_LOG="/tmp/quantstar_test.log"
 API_URL="http://127.0.0.1:9898/v1/chat/completions"
 
 pass() { echo -e "  ${GREEN}PASS${NC} $1"; PASS=$((PASS + 1)); }
@@ -21,14 +21,14 @@ cleanup() {
     echo ""
     echo "Cleaning up..."
     pkill -f "run.sh serve" 2>/dev/null || true
-    pkill -f "quenstar" 2>/dev/null || true
+    pkill -f "quantstar" 2>/dev/null || true
     sleep 2
     rm -f "$SERVER_LOG"
 }
 trap cleanup EXIT
 
 start_server() {
-    echo -e "${YELLOW}[STARTING]${NC} QuenStar server..."
+    echo -e "${YELLOW}[STARTING]${NC} QuantStar server..."
     rm -f "$SERVER_LOG"
     bash "$SCRIPT_DIR/run.sh" serve > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
@@ -85,20 +85,20 @@ test_concurrent_requests() {
         curl -s --max-time 180 -X POST "$API_URL" \
             -H 'Content-Type: application/json' \
             -d "{\"model\":\"qwen3.6-27b\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi\"}],\"max_tokens\":10}" \
-            > "/tmp/quenstar_result_$i.json" 2>/dev/null &
+            > "/tmp/quantstar_result_$i.json" 2>/dev/null &
         pids+=($!)
     done
 
     local all_ok=true
     for i in $(seq 1 3); do
         wait "${pids[$((i-1))]}" 2>/dev/null || true
-        if grep -q '"choices"' "/tmp/quenstar_result_$i.json" 2>/dev/null; then
+        if grep -q '"choices"' "/tmp/quantstar_result_$i.json" 2>/dev/null; then
             : # ok
         else
             all_ok=false
-            echo "  Request $i failed: $(head -c 100 /tmp/quenstar_result_$i.json 2>/dev/null)"
+            echo "  Request $i failed: $(head -c 100 /tmp/quantstar_result_$i.json 2>/dev/null)"
         fi
-        rm -f "/tmp/quenstar_result_$i.json"
+        rm -f "/tmp/quantstar_result_$i.json"
     done
 
     if $all_ok; then
@@ -199,7 +199,7 @@ sys.exit(1)
 
 # ── Main ────────────────────────────────────────────────────
 echo "============================================"
-echo " QuenStar End-to-End Test Suite"
+echo " QuantStar End-to-End Test Suite"
 echo "============================================"
 
 # 1. Start server

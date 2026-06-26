@@ -1,154 +1,143 @@
-# QuenStar v2
+# QuantStar
 
-**Qwen3.6-27B quantized inference in 24 GB VRAM.**
+**Run Qwen3.6-27B on a single 24GB GPU.**
 
-- 4-bit weight quantization (bitsandbytes NF4)
-- 4-bit KV cache quantization (quanto backend, patched for DeltaNet)
-- OpenAI-compatible streaming API server
-- Interactive CLI chat (Rich)
+4-bit weights + 4-bit KV cache + blockwise attention = 256k context in ~22 GB VRAM.
+Drop-in OpenAI-compatible API. Local, private, zero config.
 
-## Architecture
+## Features
 
-```
-quenstar/
-├── __init__.py     # package version
-├── __main__.py     # CLI entry point (download/serve/chat/info)
-├── config.py       # dataclass config, YAML + env var loading
-├── download.py     # HuggingFace Hub model download
-├── quantize.py     # model load + bitsandbytes 4-bit NF4 + quantized KV cache
-├── engine.py       # InferenceEngine: generation, tokenization, VRAM monitor
-├── server.py       # FastAPI OpenAI-compatible API server
-└── cli.py          # Rich-based interactive chat
-```
-
-Qwen3.6-27B has a hybrid architecture of 48 linear_attention (DeltaNet) layers + 16 full_attention layers. The QuantizedCache is monkey-patched to dispatch each layer to the correct cache type (quanto-quantized attention or quanto-quantized linear attention with recurrent states).
+- **Full 256k context** on consumer hardware - custom blockwise GQA attention keeps KV cache at native 4 KV heads
+- **4-bit everything** - NF4 weights (bitsandbytes) + int4 append-only KV cache (never re-quantizes)
+- **OpenAI-compatible API** - swap `base_url` and use any OpenAI client, agents, or tools
+- **Streaming (SSE)** - real token streaming with proper `reasoning_content` + `tool_calls` delta emission
+- **Tool calling** - model uses `<tool_call>` XML, server parses it incrementally into OpenAI-format deltas
+- **Interactive CLI** - Rich-based chat with session reuse, `/clear`, `/vram`, `/system` commands
+- **Session KV reuse** - subsequent requests sharing the same prompt prefix skip redundant prefill
 
 ## Quickstart
 
 ```bash
-./run.sh download    # download Qwen3.6-27B (52 GB, one-time)
-./run.sh chat        # interactive CLI
-./run.sh serve       # OpenAI API on 127.0.0.1:9898
-./run.sh info        # show configuration
-./run.sh init        # register in OpenCode config
+./run.sh download    # download Qwen3.6-27B (one-time, ~52 GB)
+./run.sh serve       # start the API on 127.0.0.1:9898
 ```
 
-Or use Python directly:
+That's it. Test with:
 
 ```bash
-python -m quenstar download
-python -m quenstar serve
-python -m quenstar chat
-python -m quenstar info
+curl http://127.0.0.1:9898/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3.6-27B","messages":[{"role":"user","content":"Hi!"}]}'
+```
+
+Other commands:
+
+```bash
+./run.sh chat         # interactive CLI
+./run.sh info         # show config and VRAM
+./run.sh init         # register in OpenCode config
+```
+
+`run.sh` handles everything: venv creation, CUDA 12.6 PyTorch install, dependencies, and a transformer docstring patch for Python 3.14.
+
+## Use with OpenCode
+
+Register QuantStar as a local provider:
+
+```bash
+./run.sh init
+```
+
+This writes the provider and agent config to `~/.config/opencode/opencode.json`. Then in OpenCode, run `/models` and select `quantstar/qwen3.6-27b`.
+
+Or add it manually - in your `opencode.json`:
+
+```json
+{
+  "provider": {
+    "quantstar": {
+      "name": "QuantStar (local)",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:9898/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "qwen3.6-27b": {
+          "name": "Qwen3.6 27B 4-bit (local)",
+          "reasoning": true,
+          "tools": true,
+          "limit": { "context": 262144, "output": 65536 }
+        }
+      }
+    }
+  },
+  "agent": {
+    "quantstar": {
+      "description": "Local QuantStar - Qwen3.6 27B 4-bit",
+      "model": "quantstar/qwen3.6-27b",
+      "temperature": 0
+    }
+  }
+}
 ```
 
 ## Configuration
 
-Edit `config.yaml` or use environment variables (`QUENSTAR_*` prefix):
-
-### config.yaml
+Edit `config.yaml` (or use `QUANTSTAR_*` env vars):
 
 ```yaml
 model:
   repo: "Qwen/Qwen3.6-27B"
   cache_dir: "./models"
-  torch_dtype: "bfloat16"
-  attn_implementation: "sdpa"    # or "flash_attention_2" / "eager"
-
-quantization:
-  weight_bits: 4                 # bitsandbytes NF4
-  kv_cache_bits: 4               # quanto 4-bit KV cache
 
 inference:
-  max_context: 262144            # full 262k context window
+  max_context: 262144     # full 256k
   max_new_tokens: 65536
   temperature: 0.7
-  top_p: 0.8
-  top_k: 20
-  presence_penalty: 1.5
 
 server:
   host: "127.0.0.1"
   port: 9898
-
-logging:
-  level: "INFO"
 ```
-
-### Environment variables
-
-| Variable | Overrides |
-|----------|-----------|
-| `QUENSTAR_MODEL_REPO` | `model.repo` |
-| `QUENSTAR_MODEL_CACHE` | `model.cache_dir` |
-| `QUENSTAR_WEIGHT_BITS` | `quantization.weight_bits` |
-| `QUENSTAR_KV_BITS` | `quantization.kv_cache_bits` |
-| `QUENSTAR_MAX_CONTEXT` | `inference.max_context` |
-| `QUENSTAR_HOST` | `server.host` |
-| `QUENSTAR_PORT` | `server.port` |
-| `QUENSTAR_LOG_LEVEL` | `logging.level` |
 
 ## API
 
-OpenAI-compatible endpoints served by FastAPI on `127.0.0.1:9898`:
+OpenAI-compatible at `http://127.0.0.1:9898`:
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check |
-| `GET` | `/health/vram` | GPU memory stats (`allocated_gb`, `total_gb`, `reserved_gb`, `free_gb`) |
-| `GET` | `/v1/models` | List models |
-| `GET` | `/v1/models/{id}` | Get single model |
-| `POST` | `/v1/chat/completions` | Chat completion (streaming SSE + non-streaming) |
+| `GET` | `/health/vram` | GPU memory stats |
+| `POST` | `/v1/chat/completions` | Chat completion (streaming + non-streaming) |
 
-### Streaming response format
+Streaming returns `reasoning_content` deltas for model thinking and `tool_calls` deltas when tools are provided.
 
-When `stream: true`, each SSE chunk follows the OpenAI delta format:
+## Performance
 
-- `delta.content` — regular response text
-- `delta.reasoning_content` / `delta.reasoning_text` — model thinking (between `<think>`/`</think>` tags)
-- `delta.tool_calls` — incremental tool call deltas (parsed from `<tool_call>` XML)
+Measured on RTX 3090 24GB, Python 3.14, torch 2.12.1+cu126:
 
-The server strips `<think>`/`</think>` tags from content and emits them as `reasoning_content` deltas. For small tasks (e.g. title generation), thinking is auto-disabled to avoid leaking raw tags.
+| Context | Peak VRAM | Prefill | Decode |
+|---------|-----------|---------|--------|
+| 3k | 17.1 GB | 4s | - |
+| 16k | 17.3 GB | - | 2.3 tok/s |
+| 131k | 19.7 GB | 488s | - |
+| 256k | 21.1 GB | 1685s | 0.7 tok/s |
 
-### Tool calling
+Weights: ~16.5 GB (NF4). KV cache: ~4.3 GB at 256k (int4, append-only). Headroom: ~2 GB.
 
-When `tools` are provided, the model uses `<tool_call>` XML syntax. The server parses this incrementally in streaming mode, emitting `tool_calls` deltas with function name and arguments. In non-streaming mode, the full `<tool_call>` XML is parsed and returned as a structured `tool_calls` array.
+Decode speed drops with context length because blockwise attention iterates over all cached blocks per token, dequantizing each block on the fly. At low context it's fast; at 256k it's compute-bound by the Python dispatch overhead. Future work: Triton kernel to fuse dequant + attention in a single pass.
 
-## Memory Budget
+## Session KV reuse
 
-| Component | Size |
-|-----------|------|
-| Weights (4-bit NF4) | ~16.5 GB |
-| KV cache per 1k tokens | ~16 KB (4-bit quantized) |
-| Full 262k context KV cache | ~4.3 GB |
-| Overhead (CUDA runtime) | ~1-2 GB |
-| **Total at 262k context** | **~22 GB** |
+The server keeps the KV cache alive between requests in the same session. If your next request appends to the same conversation (same message prefix), prefill is skipped - only the new tokens are processed. This means multi-turn chat is fast after the first message.
 
-| Context | KV cache | Total VRAM |
-|---------|----------|------------|
-| 32k | 0.5 GB | 18.0 GB |
-| 64k | 1.1 GB | 18.6 GB |
-| 128k | 2.1 GB | 19.6 GB |
-| 262k | 4.3 GB | 21.8 GB |
-
-## Dependencies
-
-**Runtime:** torch, transformers, accelerate, bitsandbytes, quanto, huggingface_hub, fastapi, uvicorn, sse-starlette, pyyaml, rich, tqdm
-
-**Build:** setuptools
-
-See `pyproject.toml` for version constraints. `run.sh` handles the full setup (venv creation, CUDA 12.6 pip index, dependency installation, transformers patching).
+**Constraint:** only one concurrent conversation per server instance. If you send a request that doesn't share the prefix (edit a prior message, switch conversations), the cache is invalidated and prefill restarts from scratch. For multiple independent sessions, run multiple server instances on different ports.
 
 ## Testing
 
 ```bash
-./test_quenstar.sh
+./test_quantstar.sh
 ```
 
-End-to-end bash test suite that:
-1. Starts the server and waits for readiness
-2. Tests single non-streaming request
-3. Tests streaming (SSE) request
-4. Tests 3 concurrent requests (stress test)
-5. Verifies no `<think>` tag leak into content deltas
-6. Checks server log for thread crashes, CUDA OOM, and triton autotune errors
+End-to-end: starts the server, tests streaming/non-streaming/concurrent, verifies no `<think>` tag leaks.

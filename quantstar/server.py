@@ -10,13 +10,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from .config import QuenStarConfig
+from .config import QuantStarConfig
 from .engine import InferenceEngine, _safe_messages
 
 log = logging.getLogger(__name__)
 
-ENGINE: Optional[InferenceEngine] = None
-CONFIG: Optional[QuenStarConfig] = None
+ENGINE: Optional[InferenceEngine] = None  # set by create_app()
+CONFIG: Optional[QuantStarConfig] = None   # set by create_app()
 
 
 def _is_small_task(messages: list[dict], max_tokens: Optional[int]) -> bool:
@@ -46,12 +46,12 @@ def _is_small_task(messages: list[dict], max_tokens: Optional[int]) -> bool:
     return False
 
 
-def create_app(engine: InferenceEngine, config: QuenStarConfig) -> FastAPI:
+def create_app(engine: InferenceEngine, config: QuantStarConfig) -> FastAPI:
     global ENGINE, CONFIG
     ENGINE = engine
     CONFIG = config
 
-    app = FastAPI(title="QuenStar", version="2.0.0")
+    app = FastAPI(title="QuantStar", version="2.0.0")
 
     app.add_middleware(
         CORSMiddleware,
@@ -78,7 +78,7 @@ def create_app(engine: InferenceEngine, config: QuenStarConfig) -> FastAPI:
                     "id": CONFIG.model.repo,
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "quenstar",
+                    "owned_by": "quantstar",
                     "context_window": ENGINE.max_context,
                     "max_output_tokens": ENGINE.max_new_tokens,
                 }
@@ -93,7 +93,7 @@ def create_app(engine: InferenceEngine, config: QuenStarConfig) -> FastAPI:
             "id": CONFIG.model.repo,
             "object": "model",
             "created": int(time.time()),
-            "owned_by": "quenstar",
+            "owned_by": "quantstar",
             "context_window": ENGINE.max_context,
             "max_output_tokens": ENGINE.max_new_tokens,
         }
@@ -168,7 +168,7 @@ async def _stream_response(messages, max_tokens, enable_thinking=True, tools=Non
     THINK_CLOSE = "</think>"
     TOOL_TAG = "<tool_call>"
     TOOL_CLOSE = "</tool_call>"
-    HOLD = max(len(THINK_TAG), len(THINK_CLOSE), len(TOOL_TAG), len(TOOL_CLOSE)) - 1
+    HOLD = max(len(THINK_TAG), len(THINK_CLOSE), len(TOOL_TAG), len(TOOL_CLOSE)) - 1  # chars held back to avoid emitting partial XML tags
 
     # Create per-request incremental tool call parser
     tool_parser = _make_tool_call_stream_parser(tool_index=0)

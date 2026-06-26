@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import logging
 
-from .config import QuenStarConfig
+from .config import QuantStarConfig
 from .engine import InferenceEngine
 
 log = logging.getLogger(__name__)
 
 
-def run_cli(engine: InferenceEngine, config: QuenStarConfig):
+def run_cli(engine: InferenceEngine, config: QuantStarConfig):
     from rich.console import Console
 
     console = Console()
     messages: list[dict[str, str]] = []
 
-    console.print("[bold cyan]QuenStar[/] v2.0 — [dim]Qwen3.6-27B quantized[/]")
+    console.print("[bold cyan]QuantStar[/] — [dim]Qwen3.6-27B quantized[/]")
     console.print(f"  weight bits: {config.quantization.weight_bits}")
     console.print(f"  KV cache bits: {config.quantization.kv_cache_bits}")
     console.print(f"  max context: {config.inference.max_context}")

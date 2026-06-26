@@ -1,5 +1,5 @@
 [project]
-name = "quenstar"
+name = "quantstar"
 version = "2.0.0"
 description = "Qwen3.6-27B quantized inference server — 4-bit NF4 weights, 4-bit KV cache, all in 24 GB VRAM"
 requires-python = ">=3.10"

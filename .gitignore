@@ -40,4 +40,7 @@ Thumbs.db
 # Install marker
 .deps_installed
 
+# LLM agent instructions
+AGENTS.md
+
 

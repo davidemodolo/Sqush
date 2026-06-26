@@ -11,12 +11,14 @@ import torch.nn.functional as F
 
 from transformers.cache_utils import Cache, CacheLayerMixin, LinearAttentionLayer
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # avoids OOM from allocator fragmentation with large cache blocks
 
 log = logging.getLogger(__name__)
 
 
 def _ensure_cuda_libs():
+    # bitsandbytes needs the CUDA 13 runtime lib. Search known local venv paths
+    # and prepend to LD_LIBRARY_PATH. Also ensure ninja is on PATH for triton JIT.
     cu13_paths = [
         os.path.expanduser("~/.local/lib/python3.14/site-packages/nvidia/cu13/lib"),
         "/home/davide/Documents/Dev/genai_img_audio/.venv/lib/python3.14/site-packages/nvidia/cu13/lib",
@@ -268,7 +270,7 @@ class Int4AttentionCacheLayer(CacheLayerMixin):
         return full[:, :, off:off + n, :]
 
 
-class QuenStarKVCache(Cache):
+class QuantStarKVCache(Cache):
     """Hybrid KV cache for Qwen3.6's mixed architecture.
 
     48 linear_attention (DeltaNet) layers use LinearAttentionLayer (bf16 conv/recurrent state,
@@ -361,7 +363,7 @@ def blockwise_gqa_attention(query: torch.Tensor, key: torch.Tensor, value: torch
     return out.to(dtype)
 
 
-def quenstar_attention_forward(module, query, key, value, attention_mask, dropout=0.0,
+def quantstar_attention_forward(module, query, key, value, attention_mask, dropout=0.0,
                                scaling=None, is_causal=None, **kwargs):
     """Custom attention: blockwise GQA for cached prefill (offset>0), SDPA otherwise.
 
@@ -446,7 +448,7 @@ def _patch_qwen_attention():
     during prefill (eliminates the full-dequant transient). Decode uses SDPA."""
     from transformers.models.qwen3_5 import modeling_qwen3_5 as M
 
-    if getattr(M.Qwen3_5Attention, "_quenstar_patched", False):
+    if getattr(M.Qwen3_5Attention, "_quantstar_patched", False):
         return
 
     apply_rotary_pos_emb = M.apply_rotary_pos_emb
@@ -500,19 +502,19 @@ def _patch_qwen_attention():
         return attn_output, None
 
     M.Qwen3_5Attention.forward = forward
-    M.Qwen3_5Attention._quenstar_patched = True
+    M.Qwen3_5Attention._quantstar_patched = True
 
 
 _patch_qwen_attention()
 
 
-def _register_quenstar_attention():
+def _register_quantstar_attention():
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    if "quenstar" not in ALL_ATTENTION_FUNCTIONS:
-        ALL_ATTENTION_FUNCTIONS.register("quenstar", quenstar_attention_forward)
+    if "quantstar" not in ALL_ATTENTION_FUNCTIONS:
+        ALL_ATTENTION_FUNCTIONS.register("quantstar", quantstar_attention_forward)
 
 
-_register_quenstar_attention()
+_register_quantstar_attention()
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +533,7 @@ _CacheFactory: Optional[Callable] = None
 
 
 def _make_cache_factory(model):
-    """Return a callable that creates a fresh QuenStarKVCache for each request."""
+    """Return a callable that creates a fresh QuantStarKVCache for each request."""
     global _CacheFactory
     if _CacheFactory is not None:
         return _CacheFactory
@@ -540,10 +542,10 @@ def _make_cache_factory(model):
         config = model.config
 
         def factory():
-            return QuenStarKVCache(config=config)
+            return QuantStarKVCache(config=config)
 
         _CacheFactory = factory
-        log.info("QuenStar int4 KV cache factory ready (append-only, no re-quantization)")
+        log.info("QuantStar int4 KV cache factory ready (append-only, no re-quantization)")
         return factory
     except Exception as e:
         log.warning(f"Failed to create int4 KV cache ({e}) — using dynamic cache")
@@ -568,8 +570,8 @@ def load_and_quantize_model(
         bnb_4bit_quant_type="nf4",
     )
 
-    # Load with sdpa (validated), then switch to our custom "quenstar" attention.
-    # "quenstar" is registered in ALL_ATTENTION_FUNCTIONS but NOT in the mask
+    # Load with sdpa (validated), then switch to our custom "quantstar" attention.
+    # "quantstar" is registered in ALL_ATTENTION_FUNCTIONS but NOT in the mask
     # registry, so create_causal_mask auto-skips (returns None) -> no 4D mask
     # materialized, and our attention handles causality + GQA itself.
     model = AutoModelForCausalLM.from_pretrained(
@@ -579,8 +581,8 @@ def load_and_quantize_model(
         attn_implementation=attn_implementation,
         trust_remote_code=True,
     )
-    model.config._attn_implementation = "quenstar"
-    log.info("Loaded with bitsandbytes 4-bit NF4 quantization (attn=quenstar blockwise GQA)")
+    model.config._attn_implementation = "quantstar"
+    log.info("Loaded with bitsandbytes 4-bit NF4 quantization (attn=quantstar blockwise GQA)")
 
     _print_memory_usage("after model load")
 

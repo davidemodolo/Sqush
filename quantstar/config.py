@@ -42,7 +42,7 @@ class LoggingConfig:
 
 
 @dataclass
-class QuenStarConfig:
+class QuantStarConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
@@ -50,8 +50,8 @@ class QuenStarConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
-def load_config(path: str = "config.yaml") -> QuenStarConfig:
-    cfg = QuenStarConfig()
+def load_config(path: str = "config.yaml") -> QuantStarConfig:
+    cfg = QuantStarConfig()
 
     if os.path.exists(path):
         with open(path) as f:
@@ -79,21 +79,21 @@ def load_config(path: str = "config.yaml") -> QuenStarConfig:
                     setattr(cfg.logging, k, v)
 
     for key, value in os.environ.items():
-        if key == "QUENSTAR_MODEL_REPO":
+        if key == "QUANTSTAR_MODEL_REPO":
             cfg.model.repo = value
-        elif key == "QUENSTAR_MODEL_CACHE":
+        elif key == "QUANTSTAR_MODEL_CACHE":
             cfg.model.cache_dir = value
-        elif key == "QUENSTAR_WEIGHT_BITS":
+        elif key == "QUANTSTAR_WEIGHT_BITS":
             cfg.quantization.weight_bits = int(value)
-        elif key == "QUENSTAR_KV_BITS":
+        elif key == "QUANTSTAR_KV_BITS":
             cfg.quantization.kv_cache_bits = int(value)
-        elif key == "QUENSTAR_MAX_CONTEXT":
+        elif key == "QUANTSTAR_MAX_CONTEXT":
             cfg.inference.max_context = int(value)
-        elif key == "QUENSTAR_HOST":
+        elif key == "QUANTSTAR_HOST":
             cfg.server.host = value
-        elif key == "QUENSTAR_PORT":
+        elif key == "QUANTSTAR_PORT":
             cfg.server.port = int(value)
-        elif key == "QUENSTAR_LOG_LEVEL":
+        elif key == "QUANTSTAR_LOG_LEVEL":
             cfg.logging.level = value
 
     return cfg

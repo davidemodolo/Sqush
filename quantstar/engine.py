@@ -8,7 +8,7 @@ import torch
 
 log = logging.getLogger(__name__)
 
-PREFILL_CHUNK = 1024
+PREFILL_CHUNK = 1024  # tokens per prefill chunk — bounds the FLA linear-attention transient
 
 
 def _safe_messages(messages: list[dict]) -> list[dict]:
@@ -112,6 +112,7 @@ class InferenceEngine:
 
         total_len = input_ids.shape[1]
 
+        # Reuse existing session cache when new prompt extends previous one
         if self._session_kv is not None and self._session_prompt_ids is not None:
             prompt_len = self._session_prompt_ids.shape[1]
             if total_len > prompt_len and torch.equal(input_ids[:, :prompt_len], self._session_prompt_ids):

@@ -1,9 +1,9 @@
-# QuenStar v2 — Qwen3.6-27B quantized inference
+# QuantStar — Qwen3.6-27B quantized inference
 model:
   repo: "Qwen/Qwen3.6-27B"
   cache_dir: "./models"
   torch_dtype: "bfloat16"
-  attn_implementation: "sdpa"   # load-time value; quantize.py overrides to "quenstar" (blockwise GQA) post-load. See PROGRESS.md.
+  attn_implementation: "sdpa"   # load-time value; quantize.py overrides to "quantstar" (blockwise GQA) post-load.
   # 4-bit weights via bitsandbytes NF4 quantization
 
 quantization:

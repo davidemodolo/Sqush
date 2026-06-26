@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# QuenStar v2 — Qwen3.6-27B quantized inference in 24GB VRAM
+# QuantStar — Qwen3.6-27B quantized inference in 24GB VRAM
 # One-command setup and launch.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -101,22 +101,22 @@ MODE="${1:-chat}"
 case "$MODE" in
     download)
         info "Downloading model …"
-        python -m quenstar download
+        python -m quantstar download
         ;;
     serve)
         info "Starting server …"
-        python -m quenstar serve
+        python -m quantstar serve
         ;;
     chat)
         info "Starting interactive chat …"
-        python -m quenstar chat
+        python -m quantstar chat
         ;;
     info)
-        python -m quenstar info
+        python -m quantstar info
         ;;
     init)
-        info "Registering QuenStar in OpenCode config …"
-        python -m quenstar init
+        info "Registering QuantStar in OpenCode config …"
+        python -m quantstar init
         ;;
     *)
         echo "Usage: ./run.sh [download|serve|chat|info|init]"
@@ -125,7 +125,7 @@ case "$MODE" in
         echo "  serve     — start OpenAI-compatible API server"
         echo "  chat      — start interactive CLI chat"
         echo "  info      — show configuration"
-        echo "  init      — register QuenStar in OpenCode config"
+        echo "  init      — register QuantStar in OpenCode config"
         exit 1
         ;;
 esac

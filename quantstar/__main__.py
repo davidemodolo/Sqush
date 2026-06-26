@@ -1,11 +1,11 @@
-"""QuenStar v2 — Qwen3.6-27B quantized inference server.
+"""QuantStar — Qwen3.6-27B quantized inference server.
 
 Usage:
-    python -m quenstar download           # Download the model
-    python -m quenstar serve              # Start OpenAI-compatible server
-    python -m quenstar chat               # Interactive chat
-    python -m quenstar info               # Show config and VRAM info
-    python -m quenstar init               # Register QuenStar in OpenCode config
+    python -m quantstar download           # Download the model
+    python -m quantstar serve              # Start OpenAI-compatible server
+    python -m quantstar chat               # Interactive chat
+    python -m quantstar info               # Show config and VRAM info
+    python -m quantstar init               # Register QuantStar in OpenCode config
 """
 
 from __future__ import annotations
@@ -55,8 +55,8 @@ def _init_opencode(config) -> None:
     cfg.setdefault("$schema", "https://opencode.ai/config.json")
     cfg.setdefault("provider", {})
 
-    cfg["provider"]["quenstar"] = {
-        "name": "QuenStar v2 (local)",
+    cfg["provider"]["quantstar"] = {
+        "name": "QuantStar (local)",
         "npm": "@ai-sdk/openai-compatible",
         "options": {
             "baseURL": f"http://{config.server.host}:{config.server.port}/v1",
@@ -76,9 +76,9 @@ def _init_opencode(config) -> None:
     }
 
     cfg.setdefault("agent", {})
-    cfg["agent"]["quenstar"] = {
-        "description": "Local QuenStar v2 — Qwen3.6 27B 4-bit",
-        "model": "quenstar/qwen3.6-27b",
+    cfg["agent"]["quantstar"] = {
+        "description": "Local QuantStar — Qwen3.6 27B 4-bit",
+        "model": "quantstar/qwen3.6-27b",
         "temperature": 0,
     }
 
@@ -86,24 +86,24 @@ def _init_opencode(config) -> None:
         json.dump(cfg, f, indent=2)
         f.write("\n")
 
-    print(f"  Provider: quenstar")
+    print(f"  Provider: quantstar")
     print(f"  Base URL: http://{config.server.host}:{config.server.port}/v1")
     print(f"  Context:  {config.inference.max_context:,} tokens")
     print(f"  Output:   {config.inference.max_new_tokens:,} tokens")
-    print(f"  Agent:    quenstar → quenstar/qwen3.6-27b")
+    print(f"  Agent:    quantstar → quantstar/qwen3.6-27b")
     print()
-    print("Run '/models' in OpenCode and select 'quenstar/qwen3.6-27b' to use it.")
+    print("Run '/models' in OpenCode and select 'quantstar/qwen3.6-27b' to use it.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="QuenStar v2 — Qwen3.6-27B quantized inference")
+    parser = argparse.ArgumentParser(description="QuantStar — Qwen3.6-27B quantized inference")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("download", help="Download the model from HuggingFace")
     sub.add_parser("serve", help="Start the OpenAI-compatible server")
     sub.add_parser("chat", help="Start interactive chat")
     sub.add_parser("info", help="Show configuration")
-    sub.add_parser("init", help="Register QuenStar in OpenCode config")
+    sub.add_parser("init", help="Register QuantStar in OpenCode config")
 
     parser.add_argument("--config", default="config.yaml", help="Path to config file")
     parser.add_argument("--log-level", default=None, help="Logging level")
