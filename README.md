@@ -1,279 +1,143 @@
-# QuenStar
+# QuantStar
 
-Local LLM inference server optimized for running large models on limited VRAM.
-Inspired by [DwarfStar (DS4)](https://github.com/antirez/ds4), it offloads the KV cache
-to system RAM so your GPU can dedicate its full memory to model weights.
-Built for opencode and any OpenAI-compatible client.
+**Run Qwen3.6-27B on a single 24GB GPU.**
 
-**Key features:**
-- **Model on GPU, context in RAM** — `offload_kqv=False` keeps KV cache in system memory
-- **DS4-style disk KV cache** — sessions persisted, resumed without re-prefill
-- **Temperature 0 during tool calls** — greedy decoding when model calls tools
-- **Auto-detects GPU VRAM** — picks the right model and context for your hardware
-- **OpenAI-compatible API** — `/v1/models`, `/v1/chat/completions` with SSE streaming
-- **Single-session design** — one live KV cache at a time, disk for everything else
+4-bit weights + 4-bit KV cache + blockwise attention = 256k context in ~22 GB VRAM.
+Drop-in OpenAI-compatible API. Local, private, zero config.
 
-## Quick Start
+## Features
 
-### 1. Setup
+- **Full 256k context** on consumer hardware - custom blockwise GQA attention keeps KV cache at native 4 KV heads
+- **4-bit everything** - NF4 weights (bitsandbytes) + int4 append-only KV cache (never re-quantizes)
+- **OpenAI-compatible API** - swap `base_url` and use any OpenAI client, agents, or tools
+- **Streaming (SSE)** - real token streaming with proper `reasoning_content` + `tool_calls` delta emission
+- **Tool calling** - model uses `<tool_call>` XML, server parses it incrementally into OpenAI-format deltas
+- **Interactive CLI** - Rich-based chat with session reuse, `/clear`, `/vram`, `/system` commands
+- **Session KV reuse** - subsequent requests sharing the same prompt prefix skip redundant prefill
 
-```bash
-cd QuenStar
-./run.sh --install-deps          # creates venv, installs CUDA deps
-```
-
-### 2. Authenticate with HuggingFace
+## Quickstart
 
 ```bash
-pip install huggingface_hub
-hf auth login
+./run.sh download    # download Qwen3.6-27B (one-time, ~52 GB)
+./run.sh serve       # start the API on 127.0.0.1:9898
 ```
 
-### 3. Start
+That's it. Test with:
 
 ```bash
-./run.sh                          # auto-detects GPU, downloads model, starts server
+curl http://127.0.0.1:9898/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3.6-27B","messages":[{"role":"user","content":"Hi!"}]}'
 ```
 
-That's it. `./run.sh` with no arguments:
-- Detects your GPU VRAM via `nvidia-smi`
-- Downloads the right model (35B MoE for 24GB, 14B for 8GB)
-- Starts the server on `http://127.0.0.1:8080`
+Other commands:
 
-| VRAM | Mode | Model | Size | Context |
-|------|------|-------|------|---------|
-| 24 GB | `desktop` | Qwen3.6-35B-A3B Q4_K_M | 22 GB | 128K |
-| 8 GB | `laptop` | Qwen3-14B-Instruct IQ4_XS | ~7.5 GB | 64K |
+```bash
+./run.sh chat         # interactive CLI
+./run.sh info         # show config and VRAM
+./run.sh init         # register in OpenCode config
+```
 
-### 4. Configure opencode
+`run.sh` handles everything: venv creation, CUDA 12.6 PyTorch install, dependencies, and a transformer docstring patch for Python 3.14.
 
-Add to `~/.config/opencode/opencode.json`:
+## Use with OpenCode
+
+Register QuantStar as a local provider:
+
+```bash
+./run.sh init
+```
+
+This writes the provider and agent config to `~/.config/opencode/opencode.json`. Then in OpenCode, run `/models` and select `quantstar/qwen3.6-27b`.
+
+Or add it manually - in your `opencode.json`:
 
 ```json
 {
   "provider": {
-    "quenstar": {
-      "name": "QuenStar (local)",
+    "quantstar": {
+      "name": "QuantStar (local)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "baseURL": "http://127.0.0.1:8080/v1",
+        "baseURL": "http://127.0.0.1:9898/v1",
         "apiKey": "local"
       },
       "models": {
-        "qwen3.6-35b": {
-          "name": "Qwen3.6 35B (local)",
-          "limit": { "context": 131072, "output": 32768 }
+        "qwen3.6-27b": {
+          "name": "Qwen3.6 27B 4-bit (local)",
+          "reasoning": true,
+          "tools": true,
+          "limit": { "context": 262144, "output": 65536 }
         }
       }
     }
   },
   "agent": {
-    "quenstar": {
-      "description": "Local QuenStar",
-      "model": "quenstar/qwen3.6-35b",
+    "quantstar": {
+      "description": "Local QuantStar - Qwen3.6 27B 4-bit",
+      "model": "quantstar/qwen3.6-27b",
       "temperature": 0
     }
   }
 }
 ```
 
-Then `opencode --agent quenstar`.
+## Configuration
 
-## Interactive CLI
+Edit `config.yaml` (or use `QUANTSTAR_*` env vars):
 
-In addition to the server, QuenStar has a built-in interactive chat mode for
-talking to the model directly in the terminal.
+```yaml
+model:
+  repo: "Qwen/Qwen3.6-27B"
+  cache_dir: "./models"
 
-```bash
-# Using the config-aware entry point
-python -m quenstar --chat
+inference:
+  max_context: 262144     # full 256k
+  max_new_tokens: 65536
+  temperature: 0.7
 
-# Standalone CLI with interactive mode
-python -m quenstar.cli -m ./models/qwen3.6-35b-a3b-ud-q4_k_m.gguf -i
-
-# With a system prompt
-python -m quenstar.cli -m ./models/qwen3.6-35b-a3b-ud-q4_k_m.gguf -i -s "You are a helpful assistant."
+server:
+  host: "127.0.0.1"
+  port: 9898
 ```
-
-Once loaded, you'll see:
-
-```
-Interactive chat mode. Type your message and press Enter.
-Commands: /quit, /exit, /clear, /system <prompt>
-─────────────────────────────────────────────────────────────
-
-You: Write a Python hello world
-Assistant: Here's a simple Python hello world:
-...streaming tokens...
-  [120 tok, ttft 0.3s, 45 tok/s]
-
-You:
-```
-
-### Commands
-
-| Command | Action |
-|---------|--------|
-| `/quit`, `/exit`, `/q` | Exit the chat |
-| `/clear` | Clear conversation (keeps system prompt) |
-| `/system <prompt>` | Set or change the system prompt |
-
-Press `Ctrl+C` during a response to interrupt generation without exiting.
-Press `Ctrl+C` on an empty prompt to exit.
-
-### CLI flags
-
-```
-python -m quenstar.cli --help
-  -m, --model PATH       Path to GGUF model file (required)
-  -i, --interactive      Interactive chat mode
-  -s, --system PROMPT    System prompt (interactive mode only)
-  -p, --prompt TEXT      One-shot prompt (default: "Say hello in one sentence.")
-  --ctx N                Context size (default: from config.yaml)
-  --n-gpu-layers N       GPU layers, -1 = all (default: -1)
-  --temp F               Temperature (default: from config.yaml)
-  --top-p F              Top-p sampling (default: from config.yaml)
-  --top-k N              Top-k sampling (default: from config.yaml)
-  --max-tokens N         Max tokens to generate (default: from config.yaml)
-  --offload-kqv 0|1      KV cache: 0=RAM, 1=GPU (default: 0)
-```
-
-## run.sh Usage
-
-```
-./run.sh [OPTIONS]
-
-With no arguments: detects GPU, downloads model, starts server.
-
-  -m, --model PATH      Path to GGUF model file
-  --mode MODE           Force desktop|laptop (auto-detected by default)
-  --download VARIANT    Pick a specific quantization
-  --hf-token TOKEN      HuggingFace token
-  --ctx N               Context window size (default varies by mode)
-  --port N              Server port (default: 8080)
-  --kv-dir PATH         Disk KV cache directory (default: ~/.quenstar/kv)
-  --kv-space-mb N       Max disk space for KV cache in MB (default: 8192)
-  --no-offload-kqv      Keep KV cache in system RAM instead of GPU VRAM
-  --install-deps        Install Python dependencies into a venv
-  --cors                Enable CORS headers
-  --trace               Enable trace logging
-  -h, --help            Show this help
-```
-
-## Models
-
-### Desktop (24GB VRAM)
-**Qwen3.6-35B-A3B** — 35B MoE, 3B active per token, fast inference.
-[unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
-
-| Quant | Size | VRAM |
-|-------|------|------|
-| **Q4_K_M** | 22.1 GB | 24 GB (default) |
-| Q4_K_S | 20.9 GB | 24 GB |
-| IQ4_XS | 17.7 GB | 24 GB |
-
-### Laptop (8GB VRAM)
-**Qwen3-14B-Instruct** — 14B dense, solid coding/tool-calling.
-[unsloth/Qwen3-14B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-14B-Instruct-GGUF)
-
-| Quant | Size | VRAM |
-|-------|------|------|
-| **IQ4_XS** | ~7.5 GB | 8 GB (default) |
-| Q4_K_M | ~8.7 GB | 8 GB (tight) |
-| Q3_K_M | ~6.5 GB | 8 GB |
-
-Max context: 128K desktop / 64K laptop. Use `--ctx 262144` for the 35B model max (needs ~25GB free system RAM).
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│  QuenStar Server (Python/FastAPI)               │
-│                                                 │
-│  ┌───────────────┐    ┌──────────────────────┐  │
-│  │  OpenAI API   │    │  Session Manager     │  │
-│  │  /v1/models   │    │  single live session │  │
-│  │  /v1/chat     │    │  save/load/resume    │  │
-│  └───────┬───────┘    └────────┬─────────────┘  │
-│          │                     │                │
-│  ┌───────┴─────────────────────┴─────────────┐  │
-│  │  Inference Engine (llama-cpp-python)      │  │
-│  │  Model on GPU VRAM, KV cache in sys RAM   │  │
-│  │  Temperature=0 during tool calls          │  │
-│  └───────────────────────────────────────────┘  │
-│                                                 │
-│  ┌───────────────────────────────────────────┐  │
-│  │  Disk KV Cache (~/.quenstar/kv/)          │  │
-│  │  SHA1-keyed .kv files, LRU eviction       │  │
-│  └───────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────┘
-```
-
-### Temperature 0 During Tool Calls
-
-When `tools` are present in the request, the engine forces `temperature=0` for the
-entire generation, ensuring deterministic, parseable tool call JSON.
-
-Normal sampling is used for non-tool responses.
-
-### Session Resume
-
-Sessions are persisted to disk automatically. When a request matches a cached
-session, the llama.cpp state is restored — **no re-prefill needed**. For consecutive
-turns in the same conversation, llama.cpp's internal prefix matching skips the
-shared prefix automatically.
 
 ## API
 
+OpenAI-compatible at `http://127.0.0.1:9898`:
+
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/v1/models` | List models |
-| GET | `/v1/models/{id}` | Model info |
-| POST | `/v1/chat/completions` | Chat completions (SSE streaming) |
-| GET | `/health` | Server health + KV cache stats |
-| GET | `/sessions` | List saved disk sessions |
+| `GET` | `/health` | Liveness check |
+| `GET` | `/health/vram` | GPU memory stats |
+| `POST` | `/v1/chat/completions` | Chat completion (streaming + non-streaming) |
+
+Streaming returns `reasoning_content` deltas for model thinking and `tool_calls` deltas when tools are provided.
+
+## Performance
+
+Measured on RTX 3090 24GB, Python 3.14, torch 2.12.1+cu126:
+
+| Context | Peak VRAM | Prefill | Decode |
+|---------|-----------|---------|--------|
+| 3k | 17.1 GB | 4s | - |
+| 16k | 17.3 GB | - | 2.3 tok/s |
+| 131k | 19.7 GB | 488s | - |
+| 256k | 21.1 GB | 1685s | 0.7 tok/s |
+
+Weights: ~16.5 GB (NF4). KV cache: ~4.3 GB at 256k (int4, append-only). Headroom: ~2 GB.
+
+Decode speed drops with context length because blockwise attention iterates over all cached blocks per token, dequantizing each block on the fly. At low context it's fast; at 256k it's compute-bound by the Python dispatch overhead. Future work: Triton kernel to fuse dequant + attention in a single pass.
+
+## Session KV reuse
+
+The server keeps the KV cache alive between requests in the same session. If your next request appends to the same conversation (same message prefix), prefill is skipped - only the new tokens are processed. This means multi-turn chat is fast after the first message.
+
+**Constraint:** only one concurrent conversation per server instance. If you send a request that doesn't share the prefix (edit a prior message, switch conversations), the cache is invalidated and prefill restarts from scratch. For multiple independent sessions, run multiple server instances on different ports.
+
+## Testing
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.6-35b",
-    "messages": [{"role": "user", "content": "Write a Python hello world"}],
-    "stream": true
-  }'
+./test_quantstar.sh
 ```
 
-## Running Tests
-
-```bash
-source .venv/bin/activate
-
-# All tests (needs GPU + downloaded model)
-python -m pytest tests/ -v
-
-# Skip GPU-only tests
-python -m pytest tests/ -v -m "not slow"
-
-# Run specific test
-python -m pytest tests/test_smoke.py::TestServer::test_chat_stream -v
-```
-
-Tests cover:
-
-| Test | Checks |
-|------|--------|
-| `test_cli_loads_and_generates` | Model loads, produces tokens |
-| `test_cli_rejects_bad_file` | Invalid GGUF → exit non-zero |
-| `test_cli_rejects_missing_file` | Missing file → exit non-zero |
-| `test_interactive_chat_generates_and_quits` | Interactive mode streams response, quits cleanly |
-| `test_interactive_rejects_bad_file` | Interactive mode: invalid GGUF → exit non-zero |
-| `test_interactive_rejects_missing_file` | Interactive mode: missing file → exit non-zero |
-| `test_health_endpoint` | `/health` returns ok |
-| `test_models_endpoint` | `/v1/models` lists models |
-| `test_chat_non_stream` | Non-streaming completion |
-| `test_chat_stream` | SSE streaming with content tokens |
-| `test_sessions_endpoint` | `/sessions` returns session list |
-
-## License
-
-MIT
+End-to-end: starts the server, tests streaming/non-streaming/concurrent, verifies no `<think>` tag leaks.

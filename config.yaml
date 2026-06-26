@@ -1,44 +1,26 @@
+# QuantStar — Qwen3.6-27B quantized inference
 model:
-  path: "./models/qwen3.6-35b-a3b-ud-q4_k_m.gguf"
-  n_gpu_layers: -1
-  n_ctx: 131072
-  offload_kqv: false
-  flash_attn: true
-  use_mmap: true
+  repo: "Qwen/Qwen3.6-27B"
+  cache_dir: "./models"
+  torch_dtype: "bfloat16"
+  attn_implementation: "sdpa"   # load-time value; quantize.py overrides to "quantstar" (blockwise GQA) post-load.
+  # 4-bit weights via bitsandbytes NF4 quantization
+
+quantization:
+  weight_bits: 4          # 4 = bitsandbytes NF4; 2/3 need offline quantized model
+  kv_cache_bits: 4        # KV cache quantization bits
+
+inference:
+  max_context: 262144     # full 256k — verified ~21.1 GB peak (4-bit KV ~4.3GB + 4-bit weights ~16.4GB + blockwise transient)
+  max_new_tokens: 65536
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  presence_penalty: 1.5
 
 server:
   host: "127.0.0.1"
-  port: 8080
-  cors: false
-
-kv_cache:
-  dir: "~/.quenstar/kvcache"
-  space_mb: 8192
-  save_interval_tokens: 4096
-  tail_trim_tokens: 32
-  alignment_tokens: 2048
-  eviction_half_life_hours: 6.0
-  max_saved_sessions: 1000
-
-sampling:
-  default_temperature: 0.8
-  default_top_p: 0.9
-  default_top_k: 40
-  default_min_p: 0.05
-  default_repeat_penalty: 1.0
-  tool_call_temperature: 0.0
-  tool_call_top_p: 1.0
-  tool_call_top_k: 1
-
-generation:
-  max_tokens: 32768
-  stop_strings: []
-
-tool_calling:
-  enabled: true
-  exact_replay_cache_size: 100000
-  syntax_tokens_greedy_until: 0
+  port: 9898
 
 logging:
   level: "INFO"
-  trace: false

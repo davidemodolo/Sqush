@@ -14,8 +14,10 @@ env/
 # Model files (large binaries)
 models/
 *.gguf
+*.safetensors
+*.bin
 
-# KV cache (disk sessions)
+# KV cache
 kv/
 kvcache/
 
@@ -35,7 +37,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Config with secrets (copy from config.yaml and customize)
-config.local.yaml
+# Install marker
+.deps_installed
 
+# LLM agent instructions
 AGENTS.md
+
+
