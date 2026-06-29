@@ -3,7 +3,7 @@
 **Run Qwen3.6-27B on a single 24GB GPU.**
 
 4-bit weights + 4-bit KV cache + blockwise attention = 256k context in ~22 GB VRAM.
-Drop-in OpenAI-compatible API. Local, private, zero config.
+Multimodal text + image input. Drop-in OpenAI-compatible API. Local, private, zero config.
 
 ## Features
 
@@ -12,6 +12,7 @@ Drop-in OpenAI-compatible API. Local, private, zero config.
 - **OpenAI-compatible API** - swap `base_url` and use any OpenAI client, agents, or tools
 - **Streaming (SSE)** - real token streaming with proper `reasoning_content` + `tool_calls` delta emission
 - **Tool calling** - model uses `<tool_call>` XML, server parses it incrementally into OpenAI-format deltas
+- **Image input** - Qwen3.6-VL vision encoder processes images via `image_url` content parts (base64 data URLs)
 - **Interactive CLI** - Rich-based chat with session reuse, `/clear`, `/vram`, `/system` commands
 - **Session KV reuse** - subsequent requests sharing the same prompt prefix skip redundant prefill
 
@@ -67,6 +68,10 @@ Or add it manually - in your `opencode.json`:
           "name": "Qwen3.6 27B 4-bit (local)",
           "reasoning": true,
           "tools": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
           "limit": { "context": 262144, "output": 65536 }
         }
       }
@@ -113,7 +118,28 @@ OpenAI-compatible at `http://127.0.0.1:9898`:
 
 Streaming returns `reasoning_content` deltas for model thinking and `tool_calls` deltas when tools are provided.
 
-## Performance
+### Image input
+
+Send images as base64 data URLs using OpenAI-compatible `image_url` content parts:
+
+```bash
+curl http://127.0.0.1:9898/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"Qwen/Qwen3.6-27B",
+    "messages":[{
+      "role":"user",
+      "content":[
+        {"type":"text","text":"What do you see in this image?"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+      ]
+    }]
+  }'
+```
+
+Images are processed by Qwen3.6-VL's vision encoder. Vision requests use full-model `generate()` (no chunked prefill) and reset the session KV cache. Only base64 data URLs are supported — remote URLs are not yet handled.
+
+## Text Performance
 
 Measured on RTX 3090 24GB, Python 3.14, torch 2.12.1+cu126:
 

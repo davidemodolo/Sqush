@@ -587,8 +587,7 @@ def load_and_quantize_model(
     attn_implementation: str = "sdpa",
     torch_dtype_str: str = "bfloat16",
 ) -> tuple[torch.nn.Module, object, object, Optional[object]]:
-    from transformers import AutoTokenizer, BitsAndBytesConfig
-    from transformers.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     dtype = getattr(torch, torch_dtype_str) if torch_dtype_str != "auto" else torch.bfloat16
 
@@ -601,13 +600,10 @@ def load_and_quantize_model(
         bnb_4bit_quant_type="nf4",
     )
 
-    # Load the full VL model (language + vision encoder). Use the concrete class
-    # so the vision tower is included. Load with sdpa (validated), then switch to
-    # our custom "quantstar" attention.
-    # "quantstar" is registered in ALL_ATTENTION_FUNCTIONS but NOT in the mask
-    # registry, so create_causal_mask auto-skips (returns None) -> no 4D mask
-    # materialized, and our attention handles causality + GQA itself.
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    # AutoModelForCausalLM resolves to Qwen3_5ForConditionalGeneration for Qwen3.6,
+    # loading the full VL model (language + vision encoder). Load with sdpa then
+    # switch to our custom "quantstar" attention.
+    model = AutoModelForCausalLM.from_pretrained(
         model_path,
         quantization_config=bnb_config,
         device_map="cuda:0",

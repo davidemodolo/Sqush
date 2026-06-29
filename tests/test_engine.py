@@ -253,6 +253,8 @@ class TestChatCompletionPathSelection:
     def test_vision_path_bypasses_prepare_generation(self):
         engine = _make_engine()
         engine._prepare_generation = mock.MagicMock()
+        engine.model.return_value = mock.MagicMock()
+        engine.model.return_value.past_key_values = mock.MagicMock()
         engine.model.generate.return_value = mock.MagicMock()
         engine.model.generate.return_value.shape = (1, 150)
         fake_input_ids = mock.MagicMock(shape=(1, 100))
@@ -267,11 +269,17 @@ class TestChatCompletionPathSelection:
                 max_tokens=5,
             )
         engine._prepare_generation.assert_not_called()
+        # Prefill: model.forward called with vision tensors
+        engine.model.assert_called_once()
+        prefill_kwargs = engine.model.call_args[1]
+        assert "pixel_values" in prefill_kwargs
+        assert "image_grid_thw" in prefill_kwargs
+        assert "mm_token_type_ids" in prefill_kwargs
+        # Generate: model.generate called with past_key_values but no vision tensors
         engine.model.generate.assert_called_once()
-        call_kwargs = engine.model.generate.call_args[1]
-        assert "pixel_values" in call_kwargs
-        assert "image_grid_thw" in call_kwargs
-        assert "mm_token_type_ids" in call_kwargs
+        gen_kwargs = engine.model.generate.call_args[1]
+        assert "past_key_values" in gen_kwargs
+        assert "pixel_values" not in gen_kwargs
 
     def test_vision_resets_session_cache(self):
         engine = _make_engine()

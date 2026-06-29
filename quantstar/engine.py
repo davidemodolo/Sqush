@@ -231,7 +231,34 @@ class InferenceEngine:
         if images:
             self._session_kv = None
             self._session_prompt_ids = None
+
+            cache = self.cache_factory() if self.cache_factory is not None else None
+
+            if torch.cuda.is_available():
+                vram_before = torch.cuda.memory_allocated() / (1024**3)
+                log.info("Vision prefill starting: %d tokens, int4 cache=%s, VRAM=%.1f GB",
+                         input_ids.shape[1], cache is not None, vram_before)
+
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                prefill_out = self.model(
+                    input_ids=input_ids,
+                    past_key_values=cache,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+            cache = prefill_out.past_key_values
+            prefill_s = time.perf_counter() - t0
+
+            if torch.cuda.is_available():
+                vram_prefill = torch.cuda.memory_allocated() / (1024**3)
+                log.info("Vision prefill done: %.2fs, VRAM=%.1f GB", prefill_s, vram_prefill)
+
             generate_kwargs = {
+                "past_key_values": cache,
                 "max_new_tokens": max_tokens if max_tokens is not None else self.max_new_tokens,
                 "temperature": self.temperature,
                 "top_p": self.top_p,
@@ -239,14 +266,7 @@ class InferenceEngine:
                 "do_sample": self.temperature > 0,
                 "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 "eos_token_id": self.tokenizer.eos_token_id,
-                "pixel_values": pixel_values,
-                "image_grid_thw": image_grid_thw,
-                "mm_token_type_ids": mm_token_type_ids,
             }
-
-            if torch.cuda.is_available():
-                vram_before = torch.cuda.memory_allocated() / (1024**3)
-                log.info("Vision prefill starting: %d total tokens, VRAM=%.1f GB", input_ids.shape[1], vram_before)
 
             t0 = time.perf_counter()
             with torch.no_grad():
@@ -261,8 +281,8 @@ class InferenceEngine:
             generated_ids = outputs[0][n_input:]
             text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
             n_tokens = len(generated_ids)
-            log.info("Vision: %d tokens in %.2fs (%.1f tok/s), VRAM before=%.1f after=%.1f peak=%.1f GB",
-                     n_tokens, elapsed, n_tokens / elapsed, vram_before, vram_after, peak)
+            log.info("Vision: %d tokens in %.2fs (prefill=%.2fs), VRAM before=%.1f after=%.1f peak=%.1f GB",
+                     n_tokens, elapsed, prefill_s, vram_before, vram_after, peak)
             return text, n_input, n_tokens
 
         kwargs, generate_input = self._prepare_generation(input_ids, max_tokens)
@@ -304,6 +324,37 @@ class InferenceEngine:
         if images:
             self._session_kv = None
             self._session_prompt_ids = None
+
+            cache = self.cache_factory() if self.cache_factory is not None else None
+
+            if torch.cuda.is_available():
+                vram_before = torch.cuda.memory_allocated() / (1024**3)
+                log.info("Vision prefill starting (stream): %d tokens, int4 cache=%s, VRAM=%.1f GB",
+                         input_ids.shape[1], cache is not None, vram_before)
+
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                prefill_out = self.model(
+                    input_ids=input_ids,
+                    past_key_values=cache,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
+            cache = prefill_out.past_key_values
+            prefill_s = time.perf_counter() - t0
+
+            if torch.cuda.is_available():
+                vram_prefill = torch.cuda.memory_allocated() / (1024**3)
+                log.info("Vision prefill done (stream): %.2fs, VRAM=%.1f GB", prefill_s, vram_prefill)
+
+            streamer = TextIteratorStreamer(
+                self.tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+            )
             generate_kwargs = {
                 "max_new_tokens": max_tokens if max_tokens is not None else self.max_new_tokens,
                 "temperature": self.temperature,
@@ -312,21 +363,9 @@ class InferenceEngine:
                 "do_sample": self.temperature > 0,
                 "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 "eos_token_id": self.tokenizer.eos_token_id,
-                "pixel_values": pixel_values,
-                "image_grid_thw": image_grid_thw,
-                "mm_token_type_ids": mm_token_type_ids,
+                "past_key_values": cache,
+                "streamer": streamer,
             }
-
-            if torch.cuda.is_available():
-                vram_before = torch.cuda.memory_allocated() / (1024**3)
-                log.info("Vision prefill starting (stream): %d total tokens, VRAM=%.1f GB", input_ids.shape[1], vram_before)
-
-            streamer = TextIteratorStreamer(
-                self.tokenizer,
-                skip_prompt=True,
-                skip_special_tokens=True,
-            )
-            generate_kwargs["streamer"] = streamer
 
             thread = Thread(target=self.model.generate, kwargs={"inputs": input_ids, **generate_kwargs})
             thread.start()
