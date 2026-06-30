@@ -587,7 +587,7 @@ def load_and_quantize_model(
     attn_implementation: str = "sdpa",
     torch_dtype_str: str = "bfloat16",
 ) -> tuple[torch.nn.Module, object, object, Optional[object]]:
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForImageTextToText, AutoTokenizer, BitsAndBytesConfig
 
     dtype = getattr(torch, torch_dtype_str) if torch_dtype_str != "auto" else torch.bfloat16
 
@@ -600,10 +600,10 @@ def load_and_quantize_model(
         bnb_4bit_quant_type="nf4",
     )
 
-    # AutoModelForCausalLM resolves to Qwen3_5ForConditionalGeneration for Qwen3.6,
+    # AutoModelForImageTextToText resolves to Qwen3_5ForConditionalGeneration for Qwen3.6,
     # loading the full VL model (language + vision encoder). Load with sdpa then
     # switch to our custom "quantstar" attention.
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         model_path,
         quantization_config=bnb_config,
         device_map="cuda:0",

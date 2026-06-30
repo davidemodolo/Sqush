@@ -75,23 +75,18 @@ fi
 source .venv/bin/activate
 
 # ── Install dependencies ───────────────────────────────────────
-if [ ! -f ".deps_installed" ]; then
-    info "Installing PyTorch with CUDA 12.6 …"
-    pip install torch --index-url https://download.pytorch.org/whl/cu126 -q
+DEPS_MARKER=".venv/.deps_installed"
+if [ ! -f "$DEPS_MARKER" ]; then
+    info "Installing PyTorch and Torchvision with CUDA 12.6 (this may take a while) …"
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 -q
 
-    info "Installing core dependencies …"
-    pip install pyyaml tqdm rich huggingface_hub fastapi "uvicorn[standard]" sse-starlette accelerate -q
+    info "Installing project and dependencies from pyproject.toml …"
+    pip install -e . -q
 
-    info "Installing transformers …"
-    pip install transformers -q
+    info "Installing quanto for KV cache quantization (optional) …"
+    pip install "quanto>=0.2.0" -q 2>/dev/null || warn "quanto not available — KV cache quantization disabled"
 
-    info "Installing bitsandbytes …"
-    pip install bitsandbytes -q
-
-    info "Installing quanto for KV cache quantization …"
-    pip install quanto -q 2>/dev/null || warn "quanto not available — KV cache quantization disabled"
-
-    touch .deps_installed
+    touch "$DEPS_MARKER"
     info "Dependencies installed."
 fi
 
