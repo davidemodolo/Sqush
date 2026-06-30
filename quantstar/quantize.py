@@ -589,6 +589,21 @@ def _make_cache_factory(model):
         return None
 
 
+def _model_is_pre_quantized(model_path: str) -> bool:
+    import json
+    import os
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+            qc = cfg.get("quantization_config", {})
+            return qc.get("quant_method") == "bitsandbytes"
+        except Exception:
+            pass
+    return False
+
+
 def load_and_quantize_model(
     model_path: str,
     attn_implementation: str = "sdpa",
@@ -601,25 +616,33 @@ def load_and_quantize_model(
 
     _print_memory_usage("before model load")
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=dtype,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
+    already_quantized = _model_is_pre_quantized(model_path)
 
-    # AutoModelForImageTextToText resolves to Qwen3_5ForConditionalGeneration for Qwen3.6,
-    # loading the full VL model (language + vision encoder). Load with sdpa then
-    # switch to our custom "quantstar" attention.
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_path,
-        quantization_config=bnb_config,
-        device_map="cuda:0",
-        attn_implementation=attn_implementation,
-        trust_remote_code=True,
-    )
+    if already_quantized:
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            device_map="cuda:0",
+            attn_implementation=attn_implementation,
+            trust_remote_code=True,
+        )
+        log.info("Loaded pre-quantized bitsandbytes model from disk")
+    else:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            quantization_config=bnb_config,
+            device_map="cuda:0",
+            attn_implementation=attn_implementation,
+            trust_remote_code=True,
+        )
+        log.info("Loaded with bitsandbytes 4-bit NF4 quantization (attn=quantstar blockwise GQA)")
+
     model.config._attn_implementation = "quantstar"
-    log.info("Loaded with bitsandbytes 4-bit NF4 quantization (attn=quantstar blockwise GQA)")
 
     _print_memory_usage("after model load")
 

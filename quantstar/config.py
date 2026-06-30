@@ -19,7 +19,7 @@ class VramTier(IntEnum):
 
 VRAM_PROFILES: dict[VramTier, dict] = {
     VramTier.LOW: {
-        "model": {"repo": "Qwen/Qwen3.5-9B"},
+        "model": {"repo": "techwithsergiu/Qwen3.5-9B-bnb-4bit"},
         "quantization": {"weight_bits": 4, "kv_cache_bits": 4},
         "inference": {"max_context": 131072},
     },

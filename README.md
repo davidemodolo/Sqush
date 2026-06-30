@@ -1,8 +1,8 @@
 # QuantStar
 
-**Run Qwen3.6-27B on a single 24GB GPU.**
+**Run Qwen models quantized on a single GPU — 8 GB to 24 GB VRAM.**
 
-4-bit weights + 4-bit KV cache + blockwise attention = 256k context in ~22 GB VRAM.
+4-bit weights + 4-bit KV cache + blockwise attention.
 Multimodal text + image input. Drop-in OpenAI-compatible API. Local, private, zero config.
 
 ## Features
@@ -15,6 +15,25 @@ Multimodal text + image input. Drop-in OpenAI-compatible API. Local, private, ze
 - **Image input** - Qwen3.6-VL vision encoder processes images via `image_url` content parts (base64 data URLs)
 - **Interactive CLI** - Rich-based chat with session reuse, `/clear`, `/vram`, `/system` commands
 - **Session KV reuse** - subsequent requests sharing the same prompt prefix skip redundant prefill
+
+## VRAM Tiers
+
+QuantStar auto-detects your GPU and picks the right model and settings:
+
+| VRAM | Model | Download | Context | Weight Bits | KV Bits |
+|------|-------|----------|---------|-------------|---------|
+| 8 GB | Qwen3.5-9B (pre-quantized) | 8.6 GB | 128k | 4-bit NF4 | 4-bit int4 |
+| 16 GB | *(TBD)* | — | — | — | — |
+| 24 GB | Qwen3.6-27B | 52 GB | 256k | 4-bit NF4 | 4-bit int4 |
+
+Override auto-detection with `--vram`:
+
+```bash
+./run.sh --vram 8 serve      # force 8GB profile
+python -m quantstar --vram 8 serve
+```
+
+The 8GB tier uses a pre-quantized bnb 4-bit model — just 8.6 GB to download (vs 19 GB full) and no on-the-fly quantization. The 24GB tier downloads the full model and quantizes at load time. The 8GB tier additionally quantizes embedding tables to 4-bit (per-group asymmetric), saving ~1.5 GB — bitsandbytes doesn't handle `nn.Embedding` layers.
 
 ## Quickstart
 
@@ -141,7 +160,9 @@ Images are processed by Qwen3.6-VL's vision encoder via chunked prefill. The res
 
 ## Text Performance
 
-Measured on RTX 3090 24GB, Python 3.14, torch 2.12.1+cu126:
+All benchmarks: Python 3.14, torch 2.12.1+cu126, 4-bit NF4 weights, int4 KV cache.
+
+### Qwen3.6-27B (24 GB VRAM, RTX 3090)
 
 | Context | Peak VRAM | Prefill | Decode |
 |---------|-----------|---------|--------|
@@ -153,6 +174,19 @@ Measured on RTX 3090 24GB, Python 3.14, torch 2.12.1+cu126:
 | 256k | 21.2 GB | 1649.6s | 0.8 tok/s |
 
 Weights: ~16.5 GB (NF4). KV cache: ~4.3 GB at 256k (int4, append-only). Headroom: ~2 GB.
+
+### Qwen3.5-9B (8 GB VRAM, RTX 4060 Ti)
+
+| Context | Peak VRAM | Prefill | Decode |
+|---------|-----------|---------|--------|
+| 3k | 6.4 GB | 1.3s | 23.2 tok/s |
+| 16k | 6.5 GB | 8.5s | 14.5 tok/s |
+| 32k | 6.6 GB | 21.4s | 9.5 tok/s |
+| 64k | 6.9 GB | 58.0s | 6.0 tok/s |
+| 128k | 7.4 GB | 178.1s | 3.4 tok/s |
+| 256k | 8.4 GB | 614.4s | 1.6 tok/s |
+
+Weights: ~4.9 GB (NF4 + embedding quantization). KV cache: ~2.1 GB at 256k. Note: 256k context exceeds the 8GB VRAM budget (128k target); included for completeness.
 
 Decode speed drops with context length because blockwise attention iterates over all cached blocks per token, dequantizing each block on the fly. At low context it's fast; at 256k it's compute-bound by the Python dispatch overhead. Future work: Triton kernel to fuse dequant + attention in a single pass.
 
