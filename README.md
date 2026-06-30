@@ -137,7 +137,7 @@ curl http://127.0.0.1:9898/v1/chat/completions \
   }'
 ```
 
-Images are processed by Qwen3.6-VL's vision encoder. Vision requests use full-model `generate()` (no chunked prefill) and reset the session KV cache. Only base64 data URLs are supported — remote URLs are not yet handled.
+Images are processed by Qwen3.6-VL's vision encoder via chunked prefill. The resulting KV cache is saved, so follow-up text messages in the same conversation reuse it without re-running the vision encoder. Only base64 data URLs are supported — remote URLs are not yet handled.
 
 ## Text Performance
 
@@ -158,14 +158,35 @@ Decode speed drops with context length because blockwise attention iterates over
 
 ## Session KV reuse
 
-The server keeps the KV cache alive between requests in the same session. If your next request appends to the same conversation (same message prefix), prefill is skipped - only the new tokens are processed. This means multi-turn chat is fast after the first message.
+The server keeps the KV cache alive between requests in the same session. If your next request appends to the same conversation, prefill is skipped — only the new tokens are processed. This makes multi-turn chat fast after the first message.
 
-**Constraint:** only one concurrent conversation per server instance. If you send a request that doesn't share the prefix (edit a prior message, switch conversations), the cache is invalidated and prefill restarts from scratch. For multiple independent sessions, run multiple server instances on different ports.
+This applies to both text-only and vision conversations. When an image appears in the conversation history, the vision encoder runs once for that turn and the resulting KV states are cached; subsequent text follow-ups extend the same cache rather than re-processing the image.
+
+**Constraint:** one concurrent conversation per server instance. If you send a request that doesn't share the prefix (editing a prior message, switching conversations, or a shorter history than what was cached), the cache is invalidated and prefill restarts. For multiple independent sessions, run multiple server instances on different ports.
 
 ## Testing
+
+The test suite runs entirely without loading a model — all GPU-dependent code is replaced with mocks, so tests run on CPU in a few seconds and are safe to run in CI or on any machine.
+
+```bash
+pip install -e ".[test]"
+python -m pytest tests/
+```
+
+The suite covers:
+
+- **KV cache math** — int4 quantization, packed uint8 layout, round-trip accuracy, group-boundary edge cases, `QuantStarKVCache` layer structure
+- **Blockwise GQA attention** — first prefill, cached prefill with offset, decode step, causal masking, GQA grouping, numerical stability, `blockwise_attention_from_cache`
+- **Inference engine** — image extraction, message preprocessing, tokenization paths, `_prepare_generation` kwargs, session KV cache reuse (text and vision), stream and sync paths
+- **FastAPI server** — health/VRAM endpoints, models list, sync and streaming completions, SSE format, CORS, thinking/reasoning content, tool call parsing and streaming
+- **Config loading** — YAML overrides, env var precedence, defaults
+- **CLI** — history trimming, `<think>` block stripping from display output
+- **`__main__`** — OpenCode config init and path resolution
+
+For end-to-end smoke testing against a live server (requires a GPU and the downloaded model):
 
 ```bash
 ./test_quantstar.sh
 ```
 
-End-to-end: starts the server, tests streaming/non-streaming/concurrent, verifies no `<think>` tag leaks.
+This starts the server, tests streaming and non-streaming requests, concurrent load, and verifies no `<think>` tags leak into content fields.

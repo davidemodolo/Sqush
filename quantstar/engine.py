@@ -128,19 +128,22 @@ class InferenceEngine:
 
         return cache, input_ids
 
-    def _prepare_generation(self, input_ids: torch.Tensor, max_tokens: Optional[int] = None, num_messages: int = 0) -> tuple[dict, torch.Tensor]:
+    def _prepare_generation(self, input_ids: torch.Tensor, max_tokens: Optional[int] = None, num_messages: int = 0,
+                            temperature: Optional[float] = None, top_p: Optional[float] = None) -> tuple[dict, torch.Tensor]:
         """Build generate kwargs and determine the input for generate().
 
         Reuses the session KV cache when the new prompt extends a previous one
         (messages appended, not edited). Falls back to full prefill otherwise.
         Returns (generate_kwargs, generate_input_ids).
         """
+        _temperature = temperature if temperature is not None else self.temperature
+        _top_p = top_p if top_p is not None else self.top_p
         kwargs = {
             "max_new_tokens": max_tokens if max_tokens is not None else self.max_new_tokens,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
+            "temperature": _temperature,
+            "top_p": _top_p,
             "top_k": self.top_k,
-            "do_sample": self.temperature > 0,
+            "do_sample": _temperature > 0,
             "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
@@ -273,17 +276,38 @@ class InferenceEngine:
         max_tokens: Optional[int] = None,
         enable_thinking: bool = True,
         tools: Optional[list] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> tuple[str, int, int]:
-        images = _extract_images(messages)
+        all_images = _extract_images(messages)
+
+        # Only run the vision encoder for images that aren't already in the session KV cache.
+        # Images from earlier turns are still referenced in messages but their KV states
+        # are already stored — re-running the vision encoder every turn is the bug.
+        # Guard: if len(messages) <= _session_num_messages the history was trimmed/reset;
+        # treat as a fresh turn so the stale cache isn't reused.
+        if (self._session_kv is not None
+                and self._session_num_messages > 0
+                and len(messages) > self._session_num_messages):
+            already_seen = _extract_images(messages[:self._session_num_messages])
+            has_new_images = len(all_images) > len(already_seen)
+        else:
+            has_new_images = bool(all_images)
+
+        # Tokenize with the processor whenever images appear in the conversation so that
+        # input_ids lengths are consistent with what the KV cache was built against.
         input_ids, pixel_values, image_grid_thw, mm_token_type_ids = self._tokenize(
-            messages, images=images, enable_thinking=enable_thinking, tools=tools,
+            messages, images=all_images or None, enable_thinking=enable_thinking, tools=tools,
         )
 
-        if images:
+        if has_new_images:
             self._session_kv = None
+            _temperature = temperature if temperature is not None else self.temperature
+            _top_p = top_p if top_p is not None else self.top_p
 
             cache = self.cache_factory() if self.cache_factory is not None else None
 
+            vram_before = vram_after = peak = 0.0
             if torch.cuda.is_available():
                 vram_before = torch.cuda.memory_allocated() / (1024**3)
                 log.info("Vision prefill starting: %d tokens, int4 cache=%s, VRAM=%.1f GB",
@@ -300,10 +324,10 @@ class InferenceEngine:
             generate_kwargs = {
                 "past_key_values": cache,
                 "max_new_tokens": max_tokens if max_tokens is not None else self.max_new_tokens,
-                "temperature": self.temperature,
-                "top_p": self.top_p,
+                "temperature": _temperature,
+                "top_p": _top_p,
                 "top_k": self.top_k,
-                "do_sample": self.temperature > 0,
+                "do_sample": _temperature > 0,
                 "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 "eos_token_id": self.tokenizer.eos_token_id,
             }
@@ -326,10 +350,13 @@ class InferenceEngine:
             n_tokens = len(generated_ids)
             log.info("Vision: %d tokens in %.2fs (prefill=%.2fs), VRAM before=%.1f after=%.1f peak=%.1f GB",
                      n_tokens, elapsed, prefill_s, vram_before, vram_after, peak)
+            # Save KV so follow-up text turns can extend it instead of full re-prefill.
+            if outputs.past_key_values is not None:
+                self._session_kv = outputs.past_key_values
             self._session_num_messages = len(messages)
             return text, n_input, n_tokens
 
-        kwargs, generate_input = self._prepare_generation(input_ids, max_tokens, len(messages))
+        kwargs, generate_input = self._prepare_generation(input_ids, max_tokens, len(messages), temperature=temperature, top_p=top_p)
 
         t0 = time.perf_counter()
         with torch.no_grad():
@@ -353,19 +380,32 @@ class InferenceEngine:
         max_tokens: Optional[int] = None,
         enable_thinking: bool = True,
         tools: Optional[list] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Iterator[str]:
         from threading import Thread
 
         from transformers import TextIteratorStreamer
 
-        images = _extract_images(messages)
+        all_images = _extract_images(messages)
+
+        if (self._session_kv is not None
+                and self._session_num_messages > 0
+                and len(messages) > self._session_num_messages):
+            already_seen = _extract_images(messages[:self._session_num_messages])
+            has_new_images = len(all_images) > len(already_seen)
+        else:
+            has_new_images = bool(all_images)
+
         input_ids, pixel_values, image_grid_thw, mm_token_type_ids = self._tokenize(
-            messages, images=images, enable_thinking=enable_thinking, tools=tools,
+            messages, images=all_images or None, enable_thinking=enable_thinking, tools=tools,
         )
         self._last_prompt_tokens = input_ids.shape[1]
 
-        if images:
+        if has_new_images:
             self._session_kv = None
+            _temperature = temperature if temperature is not None else self.temperature
+            _top_p = top_p if top_p is not None else self.top_p
 
             cache = self.cache_factory() if self.cache_factory is not None else None
 
@@ -389,10 +429,10 @@ class InferenceEngine:
             )
             generate_kwargs = {
                 "max_new_tokens": max_tokens if max_tokens is not None else self.max_new_tokens,
-                "temperature": self.temperature,
-                "top_p": self.top_p,
+                "temperature": _temperature,
+                "top_p": _top_p,
                 "top_k": self.top_k,
-                "do_sample": self.temperature > 0,
+                "do_sample": _temperature > 0,
                 "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "past_key_values": cache,
@@ -402,7 +442,13 @@ class InferenceEngine:
             if torch.cuda.is_available():
                 log.info("Vision generate start (stream): VRAM=%.1f GB", torch.cuda.memory_allocated() / (1024**3))
 
-            thread = Thread(target=self.model.generate, kwargs={"inputs": input_ids, "return_dict_in_generate": True, **generate_kwargs})
+            vision_out: dict = {}
+            def _vision_generate():
+                vision_out["result"] = self.model.generate(
+                    inputs=input_ids, return_dict_in_generate=True, **generate_kwargs
+                )
+
+            thread = Thread(target=_vision_generate)
             thread.start()
             yield from streamer
             thread.join()
@@ -411,10 +457,13 @@ class InferenceEngine:
                 vram_after = torch.cuda.memory_allocated() / (1024**3)
                 peak = torch.cuda.max_memory_allocated() / (1024**3)
                 log.info("Vision stream done: VRAM before=%.1f after=%.1f peak=%.1f GB", vram_before, vram_after, peak)
+            _out = vision_out.get("result")
+            if _out is not None and _out.past_key_values is not None:
+                self._session_kv = _out.past_key_values
             self._session_num_messages = len(messages)
             return
 
-        kwargs, generate_input = self._prepare_generation(input_ids, max_tokens, len(messages))
+        kwargs, generate_input = self._prepare_generation(input_ids, max_tokens, len(messages), temperature=temperature, top_p=top_p)
 
         streamer = TextIteratorStreamer(
             self.tokenizer,

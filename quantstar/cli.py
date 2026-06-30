@@ -7,6 +7,16 @@ from .engine import InferenceEngine
 
 log = logging.getLogger(__name__)
 
+_MAX_HISTORY = 40  # non-system messages to keep (20 turns)
+
+
+def _trim_history(messages: list[dict]) -> list[dict]:
+    system = [m for m in messages if m["role"] == "system"]
+    non_system = [m for m in messages if m["role"] != "system"]
+    if len(non_system) > _MAX_HISTORY:
+        non_system = non_system[-_MAX_HISTORY:]
+    return system + non_system
+
 
 def run_cli(engine: InferenceEngine, config: QuantStarConfig):
     from rich.console import Console
@@ -55,14 +65,18 @@ def run_cli(engine: InferenceEngine, config: QuantStarConfig):
             continue
 
         messages.append({"role": "user", "content": user_input})
+        messages = _trim_history(messages)
 
         console.print()
-        response_text = ""
-        for token in engine.chat_completion_stream(messages):
-            response_text += token
-            console.print(token, end="")
-        console.print()
-        console.print()
+        raw = "".join(engine.chat_completion_stream(messages))
 
-        if response_text.strip():
-            messages.append({"role": "assistant", "content": response_text})
+        think_start = raw.find("<think>")
+        if think_start != -1:
+            think_end = raw.find("</think>", think_start)
+            if think_end != -1:
+                raw = raw[think_end + len("</think>"):].strip()
+
+        if raw:
+            console.print(raw)
+            messages.append({"role": "assistant", "content": raw})
+        console.print()

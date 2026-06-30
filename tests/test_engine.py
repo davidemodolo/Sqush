@@ -7,11 +7,10 @@ from __future__ import annotations
 
 import base64
 import io
-import json
-import warnings
 from unittest import mock
 
 import pytest
+import torch
 from PIL import Image
 
 from quantstar.engine import InferenceEngine, _extract_images, _safe_messages
@@ -253,15 +252,11 @@ class TestChatCompletionPathSelection:
     def test_vision_path_bypasses_prepare_generation(self):
         engine = _make_engine()
         engine._prepare_generation = mock.MagicMock()
-        engine.model.return_value = mock.MagicMock()
-        engine.model.return_value.past_key_values = mock.MagicMock()
-        engine.model.generate.return_value = mock.MagicMock()
-        engine.model.generate.return_value.shape = (1, 150)
         fake_input_ids = mock.MagicMock(shape=(1, 100))
-        fake_pv = mock.MagicMock()
-        fake_ig = mock.MagicMock()
-        fake_mm = mock.MagicMock()
-        engine._tokenize = lambda *a, **kw: (fake_input_ids, fake_pv, fake_ig, fake_mm)
+        engine._tokenize = lambda *a, **kw: (fake_input_ids, mock.MagicMock(), mock.MagicMock(), mock.MagicMock())
+
+        fake_cache = mock.MagicMock()
+        engine._chunked_vision_prefill = mock.MagicMock(return_value=fake_cache)
 
         with mock.patch("quantstar.engine._extract_images", return_value=[mock.MagicMock()]):
             engine.chat_completion_sync(
@@ -269,31 +264,25 @@ class TestChatCompletionPathSelection:
                 max_tokens=5,
             )
         engine._prepare_generation.assert_not_called()
-        # Prefill: model.forward called with vision tensors
-        engine.model.assert_called_once()
-        prefill_kwargs = engine.model.call_args[1]
-        assert "pixel_values" in prefill_kwargs
-        assert "image_grid_thw" in prefill_kwargs
-        assert "mm_token_type_ids" in prefill_kwargs
-        # Generate: model.generate called with past_key_values but no vision tensors
+        engine._chunked_vision_prefill.assert_called_once()
         engine.model.generate.assert_called_once()
         gen_kwargs = engine.model.generate.call_args[1]
-        assert "past_key_values" in gen_kwargs
-        assert "pixel_values" not in gen_kwargs
+        assert gen_kwargs.get("past_key_values") is fake_cache
 
-    def test_vision_resets_session_cache(self):
+    def test_vision_saves_session_cache(self):
+        """Vision turn saves the generated KV cache so follow-up text turns can extend it."""
         engine = _make_engine()
         engine._session_kv = object()
-        engine._session_prompt_ids = mock.MagicMock()
-        engine.model.generate.return_value = mock.MagicMock()
-        engine.model.generate.return_value.shape = (1, 150)
+        engine._session_num_messages = 99  # stale (> len(messages)) → triggers fresh vision prefill
         fake_input_ids = mock.MagicMock(shape=(1, 100))
-        engine._tokenize = lambda *a, **kw: (fake_input_ids, None, None, None)
+        engine._tokenize = lambda *a, **kw: (fake_input_ids, mock.MagicMock(), mock.MagicMock(), mock.MagicMock())
+        engine._chunked_vision_prefill = mock.MagicMock(return_value=None)
 
         with mock.patch("quantstar.engine._extract_images", return_value=[mock.MagicMock()]):
             engine.chat_completion_sync([{"role": "user", "content": "hi"}], max_tokens=5)
-        assert engine._session_kv is None
-        assert engine._session_prompt_ids is None
+        # KV cache is now saved from model.generate output, not reset to None
+        assert engine._session_kv is not None
+        assert engine._session_num_messages == 1
 
 
 # ── chat_completion_stream path selection ───────────────────────────────────
@@ -327,6 +316,8 @@ class TestChatCompletionStreamPathSelection:
             with mock.patch("threading.Thread", RealThread):
                 with mock.patch("quantstar.engine._extract_images", return_value=[mock.MagicMock()]):
                     engine._tokenize = lambda *a, **kw: (fake_input_ids, mock.MagicMock(), mock.MagicMock(), mock.MagicMock())
+                    # _chunked_vision_prefill does real model calls; short-circuit it
+                    engine._chunked_vision_prefill = mock.MagicMock(return_value=None)
                     gen = engine.chat_completion_stream(
                         [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": _b64_image()}}]}],
                         max_tokens=5,
@@ -443,14 +434,31 @@ class TestWarmupCoverage:
 
 class TestLoadAndQuantizeSignature:
     def test_returns_4tuple(self):
-        """load_and_quantize_model must return (model, tokenizer, processor, cache_factory)."""
-        from quantstar.quantize import load_and_quantize_model
+        """load_and_quantize_model return annotation must declare a 4-element tuple."""
         import inspect
+        import typing
+        from quantstar.quantize import load_and_quantize_model
 
         sig = inspect.signature(load_and_quantize_model)
-        return_annotation = sig.return_annotation
-        # Return type should be a 4-element tuple
-        assert "object, object" in str(return_annotation) or "torch" in str(return_annotation)
+        annotation = sig.return_annotation
+        assert annotation is not inspect.Parameter.empty
+
+        # quantize.py has `from __future__ import annotations` so annotations
+        # are stored as strings (PEP 563). Resolve via get_type_hints if needed.
+        if isinstance(annotation, str):
+            hints = typing.get_type_hints(load_and_quantize_model)
+            annotation = hints.get("return", annotation)
+
+        args = getattr(annotation, "__args__", None)
+        if args is None:
+            # Fallback: verify via string representation (4-tuple has 3 commas)
+            ann_str = str(annotation)
+            assert "tuple" in ann_str.lower(), f"Not a tuple annotation: {ann_str}"
+            assert ann_str.count(",") >= 3, (
+                f"Expected 4-element tuple (3 commas), got: {ann_str}"
+            )
+        else:
+            assert len(args) == 4, f"Expected 4-tuple return annotation, got: {annotation}"
 
 
 # ── engine constructor signature ───────────────────────────────────────────
@@ -536,3 +544,324 @@ class TestTritonAutotunerPatch:
             if "NoneType" in str(e):
                 pytest.fail("Triton autotuner nargs=None crash is NOT patched! Vision requests will fail.")
             raise
+
+
+# ── _prepare_generation kwargs ────────────────────────────────────
+
+class TestPrepareGeneration:
+    """Tests for InferenceEngine._prepare_generation"""
+
+    def _engine(self):
+        return _make_engine()
+
+    def _input_ids(self, length: int = 10) -> "torch.Tensor":
+        import torch
+        return torch.zeros(1, length, dtype=torch.long)
+
+    def test_4_7_temperature_zero_disables_sampling(self):
+        """temperature=0 → do_sample=False (greedy decode)."""
+        engine = self._engine()
+        kwargs, _ = engine._prepare_generation(self._input_ids(), temperature=0.0)
+        assert kwargs["do_sample"] is False
+
+    def test_4_8_positive_temperature_enables_sampling(self):
+        """temperature>0 → do_sample=True."""
+        engine = self._engine()
+        kwargs, _ = engine._prepare_generation(self._input_ids(), temperature=0.5)
+        assert kwargs["do_sample"] is True
+
+    def test_4_9_top_p_forwarded(self):
+        """top_p parameter passed into generate kwargs."""
+        engine = self._engine()
+        kwargs, _ = engine._prepare_generation(self._input_ids(), top_p=0.95)
+        assert kwargs["top_p"] == 0.95
+
+    def test_4_9_top_k_forwarded(self):
+        """top_k (from engine default) forwarded to generate kwargs."""
+        engine = self._engine()
+        kwargs, _ = engine._prepare_generation(self._input_ids())
+        assert "top_k" in kwargs
+        assert kwargs["top_k"] == engine.top_k
+
+    def test_4_12_per_request_temperature_override(self):
+        """per-request temperature takes precedence over engine default."""
+        engine = self._engine()
+        engine.temperature = 0.7
+        kwargs, _ = engine._prepare_generation(self._input_ids(), temperature=0.1)
+        assert kwargs["temperature"] == 0.1
+
+    def test_4_12_per_request_top_p_override(self):
+        """per-request top_p takes precedence over engine default."""
+        engine = self._engine()
+        engine.top_p = 0.8
+        kwargs, _ = engine._prepare_generation(self._input_ids(), top_p=0.5)
+        assert kwargs["top_p"] == 0.5
+
+    def test_4_12_falls_back_to_engine_temp_when_none(self):
+        """when request temperature is None, engine default is used."""
+        engine = self._engine()
+        engine.temperature = 0.6
+        kwargs, _ = engine._prepare_generation(self._input_ids(), temperature=None)
+        assert kwargs["temperature"] == 0.6
+
+    def test_4_13_engine_temperature_not_mutated(self):
+        """calling _prepare_generation with temperature=X leaves engine.temperature unchanged."""
+        import torch
+        engine = self._engine()
+        engine.temperature = 0.7
+        engine.top_p = 0.8
+        engine._prepare_generation(self._input_ids(), temperature=0.1, top_p=0.2)
+        assert engine.temperature == 0.7
+        assert engine.top_p == 0.8
+
+    def test_4_6_max_tokens_applied(self):
+        """max_tokens limits max_new_tokens in kwargs."""
+        engine = self._engine()
+        kwargs, _ = engine._prepare_generation(self._input_ids(), max_tokens=42)
+        assert kwargs["max_new_tokens"] == 42
+
+    def test_4_11_pad_token_falls_back_to_eos(self):
+        """when pad_token_id is None, eos_token_id is used as pad."""
+        engine = self._engine()
+        engine.tokenizer.pad_token_id = None
+        engine.tokenizer.eos_token_id = 151645
+        kwargs, _ = engine._prepare_generation(self._input_ids())
+        assert kwargs["pad_token_id"] == 151645
+
+
+# ── session KV cache reuse ──────────────────────────────────────
+
+class TestSessionReuse:
+    """Tests for session KV cache reuse logic"""
+
+    def _engine(self):
+        return _make_engine()
+
+    def _input_ids(self, length: int = 10) -> "torch.Tensor":
+        import torch
+        return torch.zeros(1, length, dtype=torch.long)
+
+    def _mock_cache(self, seq_len: int) -> mock.MagicMock:
+        cache = mock.MagicMock()
+        cache.get_seq_length.return_value = seq_len
+        return cache
+
+    def test_6_4_new_conversation_full_prefill(self):
+        """new conversation (message count does not extend) triggers full prefill."""
+        engine = self._engine()
+        engine._session_kv = self._mock_cache(50)
+        engine._session_num_messages = 3
+
+        # num_messages=2 is not > 3, so cache reuse is skipped
+        engine._prepare_generation(self._input_ids(length=10), num_messages=2)
+
+        # Session cache replaced by full-prefill result (None since no cache_factory)
+        assert engine._session_num_messages == 2
+
+    def test_6_5_same_message_count_full_prefill(self):
+        """same message count (edited turn) triggers full prefill, not reuse."""
+        engine = self._engine()
+        engine._session_kv = self._mock_cache(50)
+        engine._session_num_messages = 3
+
+        # num_messages == session num → no reuse
+        engine._prepare_generation(self._input_ids(length=10), num_messages=3)
+
+        # Full prefill path was taken; num_messages updated
+        assert engine._session_num_messages == 3
+
+    def test_6_6_session_num_messages_tracked(self):
+        """_session_num_messages is updated after each call."""
+        engine = self._engine()
+        engine._prepare_generation(self._input_ids(), num_messages=5)
+        assert engine._session_num_messages == 5
+
+    def test_6_8_reset_session_clears_state(self):
+        """reset_session() clears _session_kv and _session_num_messages."""
+        engine = self._engine()
+        engine._session_kv = mock.MagicMock()
+        engine._session_num_messages = 7
+        engine.reset_session()
+        assert engine._session_kv is None
+        assert engine._session_num_messages == 0
+
+    def test_6_1_cache_reuse_when_messages_extend(self):
+        """follow-up message reuses previous KV cache."""
+        import torch
+        engine = self._engine()
+
+        # Simulate a 20-token session cache with 2 messages already prefilled
+        engine._session_kv = self._mock_cache(seq_len=20)
+        engine._session_num_messages = 2
+
+        # New prompt is 25 tokens (extends the 20-token prefix)
+        input_ids = torch.zeros(1, 25, dtype=torch.long)
+        kwargs, _ = engine._prepare_generation(input_ids, num_messages=3)
+
+        assert "past_key_values" in kwargs
+        assert engine._session_num_messages == 3
+
+    def test_6_12_cache_seq_len_zero_triggers_full_prefill(self):
+        """cache with seq_len==0 falls through to full prefill."""
+        import torch
+        engine = self._engine()
+
+        # Cache exists but seq_len == 0 (e.g., just allocated, nothing prefilled)
+        engine._session_kv = self._mock_cache(seq_len=0)
+        engine._session_num_messages = 2
+
+        input_ids = torch.zeros(1, 10, dtype=torch.long)
+        kwargs, _ = engine._prepare_generation(input_ids, num_messages=3)
+
+        # Inner condition (cache_seq_len > 0) fails → full prefill path taken
+        assert engine._session_num_messages == 3
+
+    def test_6_9_vision_request_saves_session(self):
+        """vision turn saves the KV cache so follow-up text turns reuse it."""
+        import torch
+        engine = self._engine()
+        engine._session_kv = mock.MagicMock()
+        engine._session_num_messages = 5  # stale (> len(messages)) → fresh vision prefill
+
+        fake_input_ids = mock.MagicMock(shape=(1, 10))
+        engine._tokenize = lambda *a, **kw: (
+            fake_input_ids, mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
+        )
+        engine._chunked_vision_prefill = mock.MagicMock(return_value=None)
+
+        with mock.patch("quantstar.engine._extract_images", return_value=[mock.MagicMock()]):
+            engine.chat_completion_sync([{"role": "user", "content": "img"}], max_tokens=1)
+
+        assert engine._session_kv is not None
+        assert engine._session_num_messages == 1
+
+    def test_6_stream_session_reuse_updates_from_generate(self):
+        """stream path stores past_key_values from generate into session cache."""
+        import torch
+
+        engine = self._engine()
+        engine._prepare_generation = mock.MagicMock(
+            return_value=({}, mock.MagicMock(shape=(1, 10)))
+        )
+
+        fake_cache = mock.MagicMock()
+
+        class FakeStreamer:
+            def __init__(self, *a, **kw): pass
+            def __iter__(self): return iter(["hello"])
+
+        class FakeGenOutput:
+            sequences = torch.zeros(1, 5, dtype=torch.long)
+            past_key_values = fake_cache
+
+        class RealThread:
+            def __init__(self, target=None, kwargs=None, **kw):
+                self._target = target
+                self._kwargs = kwargs or {}
+
+            def start(self):
+                # Inject the fake output so _generate() captures it
+                if self._target:
+                    self._target(**self._kwargs)
+
+            def join(self): pass
+
+        def fake_generate(**kwargs):
+            out = FakeGenOutput()
+            streamer = kwargs.get("streamer")
+            if streamer:
+                for t in ["hello"]:
+                    pass
+            return out
+
+        engine.model.generate.side_effect = fake_generate
+
+        with mock.patch("transformers.TextIteratorStreamer", FakeStreamer):
+            with mock.patch("threading.Thread", RealThread):
+                with mock.patch("quantstar.engine._extract_images", return_value=[]):
+                    list(engine.chat_completion_stream([{"role": "user", "content": "hi"}], max_tokens=5))
+
+        # past_key_values from generate should be stored in _session_kv
+        assert engine._session_kv is fake_cache
+
+
+# ── tokenization kwargs ─────────────────────────────────────────
+
+class TestTokenizeKwargs:
+    """Verify _tokenize passes the right kwargs to apply_chat_template"""
+
+    def _engine(self):
+        return _make_engine()
+
+    def test_7_2_enable_thinking_true_in_kwargs(self):
+        """enable_thinking=True is passed to apply_chat_template."""
+        engine = self._engine()
+        engine._tokenize([{"role": "user", "content": "hi"}], enable_thinking=True)
+        call_kw = engine.tokenizer.apply_chat_template.call_args[1]
+        assert call_kw.get("enable_thinking") is True
+
+    def test_7_3_enable_thinking_false_in_kwargs(self):
+        """enable_thinking=False is passed to apply_chat_template."""
+        engine = self._engine()
+        engine._tokenize([{"role": "user", "content": "hi"}], enable_thinking=False)
+        call_kw = engine.tokenizer.apply_chat_template.call_args[1]
+        assert call_kw.get("enable_thinking") is False
+
+    def test_7_4_preserve_thinking_always_true(self):
+        """preserve_thinking=True always set so raw think blocks are kept."""
+        engine = self._engine()
+        engine._tokenize([{"role": "user", "content": "hi"}], enable_thinking=True)
+        call_kw = engine.tokenizer.apply_chat_template.call_args[1]
+        assert call_kw.get("preserve_thinking") is True
+
+    def test_7_5_tools_forwarded(self):
+        """tools kwarg is forwarded to apply_chat_template."""
+        engine = self._engine()
+        tools = [{"type": "function", "function": {"name": "search"}}]
+        engine._tokenize([{"role": "user", "content": "hi"}], tools=tools, enable_thinking=False)
+        call_kw = engine.tokenizer.apply_chat_template.call_args[1]
+        assert call_kw.get("tools") == tools
+
+    def test_7_5_no_tools_kwarg_when_not_provided(self):
+        """tools kwarg is omitted when tools=None."""
+        engine = self._engine()
+        engine._tokenize([{"role": "user", "content": "hi"}], enable_thinking=False)
+        call_kw = engine.tokenizer.apply_chat_template.call_args[1]
+        assert "tools" not in call_kw
+
+    def test_7_1_add_generation_prompt_true(self):
+        """add_generation_prompt=True passed to apply_chat_template."""
+        engine = self._engine()
+        engine._tokenize([{"role": "user", "content": "hi"}], enable_thinking=False)
+        call_kw = engine.tokenizer.apply_chat_template.call_args[1]
+        assert call_kw.get("add_generation_prompt") is True
+
+    def test_7_6_safe_messages_converts_json_args(self):
+        """_safe_messages converts JSON-string arguments to dict."""
+        msgs = [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "f", "arguments": '{"k": "v"}'}}],
+        }]
+        from quantstar.engine import _safe_messages
+        safe = _safe_messages(msgs)
+        assert safe[0]["tool_calls"][0]["function"]["arguments"] == {"k": "v"}
+
+    def test_7_7_safe_messages_non_json_kept_as_string(self):
+        """non-JSON argument strings are kept as strings."""
+        from quantstar.engine import _safe_messages
+        msgs = [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "f", "arguments": "not json"}}],
+        }]
+        safe = _safe_messages(msgs)
+        assert safe[0]["tool_calls"][0]["function"]["arguments"] == "not json"
+
+    def test_7_8_safe_messages_no_tool_calls_unchanged(self):
+        """messages without tool_calls are returned unchanged."""
+        from quantstar.engine import _safe_messages
+        msgs = [{"role": "user", "content": "hello"}]
+        safe = _safe_messages(msgs)
+        assert safe[0]["content"] == "hello"
+        assert "tool_calls" not in safe[0]

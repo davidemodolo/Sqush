@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Optional
@@ -11,17 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from .config import QuantStarConfig
-from .engine import InferenceEngine, _safe_messages
+from .engine import InferenceEngine
 
 log = logging.getLogger(__name__)
-
-ENGINE: Optional[InferenceEngine] = None  # set by create_app()
-CONFIG: Optional[QuantStarConfig] = None   # set by create_app()
 
 
 def _is_small_task(messages: list[dict], max_tokens: Optional[int]) -> bool:
     """Detect title generation and other lightweight tasks that don't need thinking.
-    
+
     OpenCode uses a small model for title generation. When our server is the small model,
     we detect title requests by their prompt content and disable reasoning to avoid
     leaking <think> tags into the title text.
@@ -40,7 +38,6 @@ def _is_small_task(messages: list[dict], max_tokens: Optional[int]) -> bool:
         return ""
 
     combined = " ".join(_extract_text(m.get("content", "")) for m in messages).lower()
-    # OpenCode title generation typically contains these patterns
     title_markers = [
         "generate a short title",
         "generate a title for",
@@ -55,16 +52,12 @@ def _is_small_task(messages: list[dict], max_tokens: Optional[int]) -> bool:
 
 
 def create_app(engine: InferenceEngine, config: QuantStarConfig) -> FastAPI:
-    global ENGINE, CONFIG
-    ENGINE = engine
-    CONFIG = config
-
     app = FastAPI(title="QuantStar", version="2.0.0")
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -75,7 +68,7 @@ def create_app(engine: InferenceEngine, config: QuantStarConfig) -> FastAPI:
 
     @app.get("/health/vram")
     async def vram():
-        return ENGINE.get_vram_info()
+        return engine.get_vram_info()
 
     @app.get("/v1/models")
     async def list_models():
@@ -83,27 +76,27 @@ def create_app(engine: InferenceEngine, config: QuantStarConfig) -> FastAPI:
             "object": "list",
             "data": [
                 {
-                    "id": CONFIG.model.repo,
+                    "id": config.model.repo,
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "quantstar",
-                    "context_window": ENGINE.max_context,
-                    "max_output_tokens": ENGINE.max_new_tokens,
+                    "context_window": engine.max_context,
+                    "max_output_tokens": engine.max_new_tokens,
                 }
             ],
         }
 
     @app.get("/v1/models/{model_id}")
     async def get_model(model_id: str):
-        if model_id != CONFIG.model.repo:
+        if model_id != config.model.repo:
             raise HTTPException(status_code=404, detail="Model not found")
         return {
-            "id": CONFIG.model.repo,
+            "id": config.model.repo,
             "object": "model",
             "created": int(time.time()),
             "owned_by": "quantstar",
-            "context_window": ENGINE.max_context,
-            "max_output_tokens": ENGINE.max_new_tokens,
+            "context_window": engine.max_context,
+            "max_output_tokens": engine.max_new_tokens,
         }
 
     @app.post("/v1/chat/completions")
@@ -116,29 +109,28 @@ def create_app(engine: InferenceEngine, config: QuantStarConfig) -> FastAPI:
         top_p = body.get("top_p")
         tools = body.get("tools")
 
-        if temperature is not None:
-            ENGINE.temperature = temperature
-        if top_p is not None:
-            ENGINE.top_p = top_p
-
         enable_thinking = not _is_small_task(messages, max_tokens)
         log.info("POST /v1/chat/completions stream=%s enable_thinking=%s tools=%s max_tokens=%s",
                  stream, enable_thinking, bool(tools), max_tokens)
 
         if stream:
-            return EventSourceResponse(_stream_response(messages, max_tokens, enable_thinking, tools))
+            return EventSourceResponse(
+                _stream_response(messages, max_tokens, enable_thinking, tools, engine, config, temperature, top_p)
+            )
         else:
-            return _sync_response(messages, max_tokens, enable_thinking, tools)
+            return _sync_response(messages, max_tokens, enable_thinking, tools, engine, config, temperature, top_p)
 
     return app
 
 
-async def _stream_response(messages, max_tokens, enable_thinking=True, tools=None):
+async def _stream_response(messages, max_tokens, enable_thinking, tools,
+                           engine: InferenceEngine, config: QuantStarConfig,
+                           temperature=None, top_p=None):
     import asyncio
 
     request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
     created = int(time.time())
-    model = CONFIG.model.repo
+    model = config.model.repo
 
     yield {
         "event": None,
@@ -159,27 +151,26 @@ async def _stream_response(messages, max_tokens, enable_thinking=True, tools=Non
         except StopIteration:
             return None
 
-    gen = ENGINE.chat_completion_stream(messages, max_tokens, enable_thinking=enable_thinking, tools=tools)
-    prompt_tokens = ENGINE._last_prompt_tokens
+    gen = engine.chat_completion_stream(
+        messages, max_tokens, enable_thinking=enable_thinking, tools=tools,
+        temperature=temperature, top_p=top_p,
+    )
+    prompt_tokens = engine._last_prompt_tokens
 
     buffer = ""
-    # Qwen3.6 template always emits <think>\n before generation when thinking is
-    # enabled. So we start in "think" state — the model's first tokens are the
-    # reasoning content, followed by </think> and the actual response.
     state = "think" if enable_thinking else "post"
     think_emitted = 0
     content_emitted = 0
     tool_calls_emitted = 0
     has_tool_calls = False
+    tool_call_count = 0
+    tool_parser = None
 
     THINK_TAG = "<think>"
     THINK_CLOSE = "</think>"
     TOOL_TAG = "<tool_call>"
     TOOL_CLOSE = "</tool_call>"
-    HOLD = max(len(THINK_TAG), len(THINK_CLOSE), len(TOOL_TAG), len(TOOL_CLOSE)) - 1  # chars held back to avoid emitting partial XML tags
-
-    # Create per-request incremental tool call parser
-    tool_parser = _make_tool_call_stream_parser(tool_index=0)
+    HOLD = max(len(THINK_TAG), len(THINK_CLOSE), len(TOOL_TAG), len(TOOL_CLOSE)) - 1
 
     log.info("_stream_response start enable_thinking=%s state=%s tools=%s max_tokens=%s prompt_tokens=%d",
              enable_thinking, state, bool(tools), max_tokens, prompt_tokens)
@@ -193,7 +184,6 @@ async def _stream_response(messages, max_tokens, enable_thinking=True, tools=Non
         if state == "think":
             end_idx = buffer.find(THINK_CLOSE, think_emitted)
             if end_idx == -1:
-                # Hold back HOLD chars to avoid leaking partial </think>
                 safe_end = max(think_emitted, len(buffer) - HOLD)
                 if safe_end > think_emitted:
                     text = buffer[think_emitted:safe_end]
@@ -224,7 +214,9 @@ async def _stream_response(messages, max_tokens, enable_thinking=True, tools=Non
                 tool_calls_emitted = content_emitted
                 state = "tool_call"
                 has_tool_calls = True
-                log.info("_stream_response found <tool_call> → state=tool_call")
+                tool_parser = _make_tool_call_stream_parser(tool_index=tool_call_count)
+                tool_call_count += 1
+                log.info("_stream_response found <tool_call> #%d → state=tool_call", tool_call_count)
 
         if state == "tool_call":
             end_idx = buffer.find(TOOL_CLOSE, tool_calls_emitted)
@@ -244,15 +236,12 @@ async def _stream_response(messages, max_tokens, enable_thinking=True, tools=Non
                 log.info("_stream_response found </tool_call> → state=post")
                 continue
 
-        # After all state-specific processing, if we're in post and
-        # have hit end of stream, flush any remaining holdback
         if state == "post" and content_emitted < len(buffer):
             remaining = buffer[content_emitted:]
             if remaining:
                 yield _delta_chunk(request_id, created, model, content=remaining)
                 content_emitted = len(buffer)
 
-    # Flush final holdback
     if state == "post" and content_emitted < len(buffer):
         remaining = buffer[content_emitted:]
         if remaining:
@@ -262,7 +251,7 @@ async def _stream_response(messages, max_tokens, enable_thinking=True, tools=Non
         if remaining:
             yield _delta_chunk(request_id, created, model, reasoning_content=remaining)
 
-    completion_tokens = len(ENGINE.tokenizer.encode(buffer, add_special_tokens=False))
+    completion_tokens = len(engine.tokenizer.encode(buffer, add_special_tokens=False))
 
     log.info("_stream_response done prompt_tokens=%d completion_tokens=%d total_tokens=%d buffer_chars=%d",
              prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, len(buffer))
@@ -300,7 +289,6 @@ def _make_tool_call_stream_parser(tool_index: int = 0):
     because JSON restructures when new keys are added (comma insertion breaks
     prefix-based concatenation).
     """
-    import re
     import uuid as _uuid
 
     state = dict(
@@ -318,7 +306,6 @@ def _make_tool_call_stream_parser(tool_index: int = 0):
         buff = state["buff"]
         result = []
 
-        # Extract function name as soon as we see <function=NAME>
         if not state["emitted_name"]:
             m = re.search(r'<function=([^>]+)>', buff)
             if m:
@@ -332,7 +319,6 @@ def _make_tool_call_stream_parser(tool_index: int = 0):
                 buff = buff[m.end():]
                 state["buff"] = buff
 
-        # On finalize, parse all complete <parameter> blocks and emit arguments
         if finalize and state["emitted_name"]:
             param_pattern = re.compile(
                 r'<parameter=([^>]+)>\s*(.*?)\s*</parameter>', re.DOTALL
@@ -379,9 +365,12 @@ def _delta_chunk(request_id, created, model, content=None, reasoning_content=Non
     }
 
 
-def _sync_response(messages, max_tokens, enable_thinking=True, tools=None):
-    raw_text, prompt_tokens, completion_tokens = ENGINE.chat_completion_sync(
-        messages, max_tokens, enable_thinking=enable_thinking, tools=tools
+def _sync_response(messages, max_tokens, enable_thinking, tools,
+                   engine: InferenceEngine, config: QuantStarConfig,
+                   temperature=None, top_p=None):
+    raw_text, prompt_tokens, completion_tokens = engine.chat_completion_sync(
+        messages, max_tokens, enable_thinking=enable_thinking, tools=tools,
+        temperature=temperature, top_p=top_p,
     )
     log.info("_sync_response done prompt_tokens=%d completion_tokens=%d total_tokens=%d text_chars=%d",
              prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, len(raw_text))
@@ -397,35 +386,31 @@ def _sync_response(messages, max_tokens, enable_thinking=True, tools=None):
             reasoning_content = raw_text[think_start + len("<think>"):think_end].strip()
             content = raw_text[think_end + len("</think>"):].strip()
 
-    # Parse tool calls from content
-    tool_start = content.find("<tool_call>")
-    if tool_start != -1:
-        tool_end = content.find("</tool_call>", tool_start)
-        if tool_end != -1:
-            tool_xml = content[tool_start + len("<tool_call>"):tool_end]
-            text_before = content[:tool_start].strip()
-            content = text_before if text_before else None
-            # Create a fresh incremental parser for sync parsing
-            tool_parser = _make_tool_call_stream_parser(tool_index=0)
-            tool_call_deltas = tool_parser(tool_xml, finalize=True)
-            if tool_call_deltas:
-                # Merge deltas: first has id+name, subsequent have incremental args
-                tool_calls = []
-                current = None
-                for delta_list in tool_call_deltas:
-                    for d in delta_list:
-                        if "id" in d:
-                            current = {
-                                "id": d["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": d["function"]["name"],
-                                    "arguments": d["function"]["arguments"],
-                                },
-                            }
-                            tool_calls.append(current)
-                        elif current is not None and "function" in d:
-                            current["function"]["arguments"] += d["function"]["arguments"]
+    first_tool = content.find("<tool_call>") if content else -1
+    if first_tool != -1:
+        text_before = content[:first_tool].strip()
+        tool_calls_list = []
+        for idx, m in enumerate(re.finditer(r'<tool_call>(.*?)</tool_call>', content, re.DOTALL)):
+            tool_xml = m.group(1)
+            parser = _make_tool_call_stream_parser(tool_index=idx)
+            deltas = parser(tool_xml, finalize=True)
+            current = None
+            for delta_list in deltas:
+                for d in delta_list:
+                    if "id" in d:
+                        current = {
+                            "id": d["id"],
+                            "type": "function",
+                            "function": {
+                                "name": d["function"]["name"],
+                                "arguments": d["function"]["arguments"],
+                            },
+                        }
+                        tool_calls_list.append(current)
+                    elif current is not None and "function" in d:
+                        current["function"]["arguments"] += d["function"]["arguments"]
+        content = text_before if text_before else None
+        tool_calls = tool_calls_list if tool_calls_list else None
 
     message = {"role": "assistant", "content": content}
     if reasoning_content:
@@ -440,7 +425,7 @@ def _sync_response(messages, max_tokens, enable_thinking=True, tools=None):
         "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": CONFIG.model.repo,
+        "model": config.model.repo,
         "choices": [
             {
                 "index": 0,

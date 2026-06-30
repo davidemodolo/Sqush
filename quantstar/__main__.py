@@ -43,7 +43,7 @@ def _warmup_engine(engine) -> None:
             text, _, _ = engine.chat_completion_sync(messages, max_tokens=1, enable_thinking=False)
             log.info("Warmup %d tokens: %r", n_tokens, text[:60])
         except Exception as exc:
-            log.warning("Warmup %d tokens failed (non-fatal): %s", exc)
+            log.warning("Warmup %d tokens failed (non-fatal): %s", n_tokens, exc)
 
     engine.reset_session()
     _torch.cuda.synchronize()
@@ -88,14 +88,6 @@ def _init_opencode(config) -> None:
             }
         },
     }
-
-    # Patch any existing provider model entries that lack modalities
-    for provider_name, provider_cfg in cfg.get("provider", {}).items():
-        if not isinstance(provider_cfg, dict):
-            continue
-        for model_id, model_cfg in provider_cfg.get("models", {}).items():
-            if isinstance(model_cfg, dict) and "modalities" not in model_cfg:
-                model_cfg["modalities"] = {"input": ["text", "image"], "output": ["text"]}
 
     cfg.setdefault("agent", {})
     cfg["agent"]["quantstar"] = {

@@ -4,7 +4,7 @@ import gc
 import logging
 import os
 import sys
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -47,12 +47,10 @@ log = logging.getLogger(__name__)
 
 
 def _ensure_cuda_libs():
-    # bitsandbytes needs the CUDA 13 runtime lib. Search known local venv paths
-    # and prepend to LD_LIBRARY_PATH. Also ensure ninja is on PATH for triton JIT.
+    py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     cu13_paths = [
-        os.path.expanduser("~/.local/lib/python3.14/site-packages/nvidia/cu13/lib"),
-        "/home/davide/Documents/Dev/genai_img_audio/.venv/lib/python3.14/site-packages/nvidia/cu13/lib",
-        "/home/davide/Documents/Dev/alphamon/.venv/lib/python3.14/site-packages/nvidia/cu13/lib",
+        os.path.expanduser(f"~/.local/lib/{py_ver}/site-packages/nvidia/cu13/lib"),
+        os.path.join(sys.prefix, "lib", py_ver, "site-packages", "nvidia", "cu13", "lib"),
     ]
     for p in cu13_paths:
         if os.path.isdir(p) and p not in os.environ.get("LD_LIBRARY_PATH", ""):
@@ -575,15 +573,7 @@ def _print_memory_usage(prefix: str = "") -> None:
     log.info(f"{prefix} GPU memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
 
 
-_CacheFactory: Optional[Callable] = None
-
-
 def _make_cache_factory(model):
-    """Return a callable that creates a fresh QuantStarKVCache for each request."""
-    global _CacheFactory
-    if _CacheFactory is not None:
-        return _CacheFactory
-
     try:
         config = model.config
         _dtype = model.dtype if hasattr(model, "dtype") else torch.bfloat16
@@ -592,7 +582,6 @@ def _make_cache_factory(model):
         def factory():
             return QuantStarKVCache(config=config, dtype=_dtype, device=_device)
 
-        _CacheFactory = factory
         log.info("QuantStar int4 KV cache factory ready (append-only, no re-quantization)")
         return factory
     except Exception as e:
