@@ -593,6 +593,7 @@ def load_and_quantize_model(
     model_path: str,
     attn_implementation: str = "sdpa",
     torch_dtype_str: str = "bfloat16",
+    quantize_embeddings: bool = False,
 ) -> tuple[torch.nn.Module, object, object, Optional[object]]:
     from transformers import AutoModelForImageTextToText, AutoTokenizer, BitsAndBytesConfig
 
@@ -633,7 +634,106 @@ def load_and_quantize_model(
     from transformers.models.qwen3_vl import Qwen3VLProcessor
     processor = Qwen3VLProcessor.from_pretrained(model_path)
 
+    # Quantize embeddings to 4-bit (bitsandbytes doesn't handle nn.Embedding)
+    if quantize_embeddings:
+        _quantize_embeddings(model)
+        gc.collect()
+        torch.cuda.empty_cache()
+
     cache_factory = _make_cache_factory(model)
 
     model.eval()
     return model, tokenizer, processor, cache_factory
+
+
+# ---------------------------------------------------------------------------
+# Embedding quantization — saves ~1.5 GB on the 248k×4096 vocab table
+# ---------------------------------------------------------------------------
+
+_EMBED_GROUP_SIZE = 128
+
+
+class QuantizedEmbedding(torch.nn.Module):
+    """4-bit quantized embedding with per-group asymmetric quantization.
+
+    Only dequantizes the rows accessed by the input indices, not the full table.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, qweight: torch.Tensor,
+                 scales: torch.Tensor, zero_points: torch.Tensor):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.register_buffer("_qw", qweight)
+        self.register_buffer("_sc", scales)
+        self.register_buffer("_zp", zero_points)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        n = indices.numel()
+        if n == 0:
+            return torch.empty(0, self.embedding_dim, device=indices.device, dtype=torch.bfloat16)
+
+        num_groups = (self.embedding_dim + _EMBED_GROUP_SIZE - 1) // _EMBED_GROUP_SIZE
+        padded = num_groups * _EMBED_GROUP_SIZE
+
+        flat = indices.flatten()
+        qw = self._qw[flat]  # [n, num_groups, 16]
+        sc = self._sc[flat]  # [n, num_groups]
+        zp = self._zp[flat]  # [n, num_groups]
+
+        device = indices.device
+        shift = torch.arange(8, device=device, dtype=torch.int32)
+        # qw: [n, num_groups, 16] → unpack → [n, num_groups, 128]
+        vals = (qw.unsqueeze(-1) >> (shift * 4)) & 0xF  # [n, num_groups, 16, 8]
+        vals = vals.reshape(n, num_groups, _EMBED_GROUP_SIZE)
+
+        w = ((vals.to(torch.bfloat16) - zp.unsqueeze(-1).to(torch.bfloat16))
+             * sc.unsqueeze(-1).to(torch.bfloat16))
+        w = w[:, :, : self.embedding_dim]
+        return w.reshape(*indices.shape, self.embedding_dim)
+
+
+def _quantize_embeddings(model: torch.nn.Module) -> None:
+    """Replace all nn.Embedding layers with QuantizedEmbedding."""
+    replacements = []
+
+    def _walk(module, prefix):
+        for name, child in list(module.named_children()):
+            path = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, torch.nn.Embedding):
+                replacements.append((module, name, child))
+            else:
+                _walk(child, path)
+
+    _walk(model, "")
+
+    for parent, name, child in replacements:
+        w = child.weight.data
+        out_f, in_f = w.shape
+        num_groups = (in_f + _EMBED_GROUP_SIZE - 1) // _EMBED_GROUP_SIZE
+        pad = num_groups * _EMBED_GROUP_SIZE - in_f
+        if pad:
+            w = torch.nn.functional.pad(w, (0, pad), value=0)
+
+        w_f = w.float().reshape(out_f, num_groups, _EMBED_GROUP_SIZE)
+        w_min = w_f.amin(dim=-1)
+        w_max = w_f.amax(dim=-1)
+        scale = (w_max - w_min).clamp(min=1e-9) / 15.0
+        zp = (-w_min / scale).round().clamp(0, 15).to(torch.int32)
+        q = ((w_f / scale.unsqueeze(-1)).round() + zp.unsqueeze(-1)).clamp(0, 15).to(torch.int32)
+
+        gs = _EMBED_GROUP_SIZE
+        q = torch.nn.functional.pad(q, (0, (8 - gs % 8) % 8))
+        q = q.reshape(out_f, num_groups, -1, 8)
+        packed = torch.zeros(out_f, num_groups, q.shape[2], dtype=torch.int32, device=w.device)
+        for i in range(8):
+            packed |= (q[..., i] & 0xF) << (i * 4)
+
+        new = QuantizedEmbedding(out_f, in_f, packed, scale.to(torch.bfloat16), zp)
+        setattr(parent, name, new)
+        # Help GC: free the old weight
+        child.weight.data = torch.empty(0, device='cpu')
+        del w, w_f, scale, zp, q, packed, child
+    del replacements
+    gc.collect()
+    torch.cuda.empty_cache()

@@ -121,11 +121,12 @@ def main():
 
     parser.add_argument("--config", default="config.yaml", help="Path to config file")
     parser.add_argument("--log-level", default=None, help="Logging level")
+    parser.add_argument("--vram", default=None, type=int, help="VRAM budget in GB (auto-detected if not set)")
 
     args = parser.parse_args()
 
-    from .config import load_config
-    config = load_config(args.config)
+    from .config import load_config, VramTier
+    config = load_config(args.config, vram_gb=args.vram)
 
     log_level = (args.log_level or config.logging.level).upper()
     logging.basicConfig(
@@ -165,6 +166,7 @@ def main():
             model_path=model_path,
             attn_implementation=config.model.attn_implementation,
             torch_dtype_str=config.model.torch_dtype,
+            quantize_embeddings=(config.vram_tier == VramTier.LOW),
         )
 
         from .engine import InferenceEngine

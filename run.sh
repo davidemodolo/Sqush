@@ -90,28 +90,50 @@ if [ ! -f "$DEPS_MARKER" ]; then
     info "Dependencies installed."
 fi
 
+# ── Parse --vram override ──────────────────────────────────────
+VRAM_OVERRIDE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --vram)
+            VRAM_OVERRIDE="$2"
+            shift 2
+            ;;
+        --vram=*)
+            VRAM_OVERRIDE="${1#*=}"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+if [ -n "$VRAM_OVERRIDE" ]; then
+    VRAM_GB="$VRAM_OVERRIDE"
+    info "VRAM override: ${VRAM_GB} GB"
+fi
+
 # ── Launch ─────────────────────────────────────────────────────
 MODE="${1:-chat}"
 
 case "$MODE" in
     download)
         info "Downloading model …"
-        python -m quantstar download
+        python -m quantstar --vram "$VRAM_GB" download
         ;;
     serve)
         info "Starting server …"
-        python -m quantstar serve
+        python -m quantstar --vram "$VRAM_GB" serve
         ;;
     chat)
         info "Starting interactive chat …"
-        python -m quantstar chat
+        python -m quantstar --vram "$VRAM_GB" chat
         ;;
     info)
-        python -m quantstar info
+        python -m quantstar --vram "$VRAM_GB" info
         ;;
     init)
         info "Registering QuantStar in OpenCode config …"
-        python -m quantstar init
+        python -m quantstar --vram "$VRAM_GB" init
         ;;
     *)
         echo "Usage: ./run.sh [download|serve|chat|info|init]"
