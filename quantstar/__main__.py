@@ -267,7 +267,7 @@ def _init_opencode(config) -> None:
                 },
             },
             "qwen3.5-9b": {
-                "name": "Qwen3.5 9B 4-bit (local, 8GB)",
+                "name": "Qwen3.5 9B 4-bit (local)",
                 "reasoning": True,
                 "tools": True,
                 "modalities": {
@@ -279,25 +279,13 @@ def _init_opencode(config) -> None:
         },
     }
 
-    cfg.setdefault("agent", {})
-    cfg["agent"]["quantstar"] = {
-        "description": "Local QuantStar — Qwen3.6 27B 4-bit",
-        "model": "quantstar/qwen3.6-27b",
-        "temperature": 0,
-    }
-    cfg["agent"]["quantstar-8gb"] = {
-        "description": "Local QuantStar — Qwen3.5 9B 4-bit (8GB tier)",
-        "model": "quantstar/qwen3.5-9b",
-        "temperature": 0,
-    }
-
     with open(config_path, "w") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
 
     print(f"  Provider: quantstar")
     print(f"  Base URL: http://{config.server.host}:{config.server.port}/v1")
-    print(f"  Agents:   quantstar → qwen3.6-27b (24GB), quantstar-8gb → qwen3.5-9b (8GB)")
+    print(f"  Models:   qwen3.6-27b (24GB), qwen3.5-9b (8GB)")
     print()
     print("Run '/models' in OpenCode and select a quantstar model to use it.")
 

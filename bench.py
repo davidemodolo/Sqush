@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import logging
 import os
 import sys
 import time
@@ -97,13 +98,33 @@ def main():
 
     print("\n[1/2] Loading model …")
 
+    from pathlib import Path
     from quantstar.quantize import load_and_quantize_model
-    model_path = download_model(config.model.repo, config.model.cache_dir)
+    from quantstar.__main__ import _bake_model, _cooked_model_path
+
+    log = logging.getLogger("bench")
+
+    is_low = config.vram_tier == VramTier.LOW
+    if is_low:
+        raw_path = str(
+            Path(config.model.cache_dir).resolve()
+            / config.model.repo.replace("/", "__")
+        )
+        cooked = _cooked_model_path(raw_path)
+        if os.path.exists(cooked):
+            model_path = cooked
+        else:
+            model_path = download_model(config.model.repo, config.model.cache_dir)
+            model_path = _bake_model(model_path, config, log)
+    else:
+        model_path = download_model(config.model.repo, config.model.cache_dir)
+
     model, tokenizer, processor, cache_config = load_and_quantize_model(
         model_path=model_path,
         attn_implementation=config.model.attn_implementation,
         torch_dtype_str=config.model.torch_dtype,
-        quantize_embeddings=(config.vram_tier == VramTier.LOW),
+        quantize_embeddings=is_low,
+        quantize_vision_encoder=False,
     )
 
     max_ctx = args.max_context or config.inference.max_context
