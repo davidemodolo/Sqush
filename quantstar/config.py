@@ -1,9 +1,39 @@
 from __future__ import annotations
 
+import logging
 import os
+import subprocess
 from dataclasses import dataclass, field
+from enum import IntEnum
 
 import yaml
+
+log = logging.getLogger(__name__)
+
+
+class VramTier(IntEnum):
+    LOW = 8
+    MEDIUM = 16
+    HIGH = 24
+
+
+VRAM_PROFILES: dict[VramTier, dict] = {
+    VramTier.LOW: {
+        "model": {"repo": "techwithsergiu/Qwen3.5-9B-bnb-4bit"},
+        "quantization": {"weight_bits": 4, "kv_cache_bits": 4},
+        "inference": {"max_context": 131072, "max_image_pixels": 131072, "min_image_pixels": 16384},
+    },
+    VramTier.MEDIUM: {
+        "model": {"repo": None},
+        "quantization": {"weight_bits": 4, "kv_cache_bits": 4},
+        "inference": {"max_context": None},
+    },
+    VramTier.HIGH: {
+        "model": {"repo": "Qwen/Qwen3.6-27B"},
+        "quantization": {"weight_bits": 4, "kv_cache_bits": 4},
+        "inference": {"max_context": 262144},
+    },
+}
 
 
 @dataclass
@@ -28,6 +58,8 @@ class InferenceConfig:
     top_p: float = 0.8
     top_k: int = 20
     presence_penalty: float = 1.5
+    max_image_pixels: int | None = None  # max total pixels before vision encoder; None = no limit
+    min_image_pixels: int | None = None  # min total pixels (must be set alongside max_image_pixels)
 
 
 @dataclass
@@ -48,10 +80,43 @@ class QuantStarConfig:
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    vram_tier: VramTier | None = None
 
 
-def load_config(path: str = "config.yaml") -> QuantStarConfig:
+def detect_vram() -> int:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            text=True,
+        )
+        return int(out.strip().split("\n")[0]) // 1024
+    except Exception:
+        return 0
+
+
+def classify_vram(raw_gb: int) -> VramTier:
+    if raw_gb >= 20:
+        return VramTier.HIGH
+    if raw_gb >= 12:
+        return VramTier.MEDIUM
+    return VramTier.LOW
+
+
+def load_config(path: str = "config.yaml", vram_gb: int | None = None) -> QuantStarConfig:
     cfg = QuantStarConfig()
+
+    if vram_gb is None:
+        vram_gb = detect_vram()
+
+    tier = classify_vram(vram_gb)
+    cfg.vram_tier = tier
+    profile = VRAM_PROFILES.get(tier)
+    if profile is not None:
+        for section, overrides in profile.items():
+            target = getattr(cfg, section)
+            for k, v in overrides.items():
+                if v is not None and hasattr(target, k):
+                    setattr(target, k, v)
 
     if os.path.exists(path):
         with open(path) as f:

@@ -1,17 +1,16 @@
-# QuantStar — Qwen3.6-27B quantized inference
+# QuantStar configuration
+# model.repo and inference.max_context are set by the --vram profile (8 GB → 9B/128k, 24 GB → 27B/256k).
+# Override them here only if you need a custom model or context length.
 model:
-  repo: "Qwen/Qwen3.6-27B"
   cache_dir: "./models"
   torch_dtype: "bfloat16"
-  attn_implementation: "sdpa"   # load-time value; quantize.py overrides to "quantstar" (blockwise GQA) post-load.
-  # 4-bit weights via bitsandbytes NF4 quantization
+  attn_implementation: "sdpa"
 
 quantization:
-  weight_bits: 4          # 4 = bitsandbytes NF4; 2/3 need offline quantized model
-  kv_cache_bits: 4        # KV cache quantization bits
+  weight_bits: 4
+  kv_cache_bits: 4
 
 inference:
-  max_context: 262144     # full 256k — verified ~21.1 GB peak (4-bit KV ~4.3GB + 4-bit weights ~16.4GB + blockwise transient)
   max_new_tokens: 65536
   temperature: 0.7
   top_p: 0.8

@@ -144,12 +144,11 @@ class TestInitOpencode:
         assert "$schema" in result
         assert "opencode" in result["$schema"]
 
-    def test_agent_entry_written(self):
-        """_init_opencode also writes an agent entry for quantstar."""
+    def test_no_agent_entry_written(self):
+        """_init_opencode registers the provider only, not agents."""
         cfg = _make_config()
         result = self._run_init(cfg)
-        assert "agent" in result
-        assert "quantstar" in result["agent"]
+        assert "quantstar" not in result.get("agent", {})
 
 
 class TestOpenCodeConfigPath:

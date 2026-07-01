@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# QuantStar — Qwen3.6-27B quantized inference in 24GB VRAM
+# QuantStar — quantized Qwen inference (8 GB and 24 GB VRAM)
 # One-command setup and launch.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -90,33 +90,60 @@ if [ ! -f "$DEPS_MARKER" ]; then
     info "Dependencies installed."
 fi
 
+# ── Parse --vram override ──────────────────────────────────────
+VRAM_OVERRIDE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --vram)
+            VRAM_OVERRIDE="$2"
+            shift 2
+            ;;
+        --vram=*)
+            VRAM_OVERRIDE="${1#*=}"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+if [ -n "$VRAM_OVERRIDE" ]; then
+    VRAM_GB="$VRAM_OVERRIDE"
+    info "VRAM override: ${VRAM_GB} GB"
+fi
+
 # ── Launch ─────────────────────────────────────────────────────
 MODE="${1:-chat}"
 
 case "$MODE" in
     download)
         info "Downloading model …"
-        python -m quantstar download
+        python -m quantstar --vram "$VRAM_GB" download
+        ;;
+    bake)
+        info "Baking model (quantize visual encoder, one-time) …"
+        python -m quantstar --vram "$VRAM_GB" bake
         ;;
     serve)
         info "Starting server …"
-        python -m quantstar serve
+        python -m quantstar --vram "$VRAM_GB" serve
         ;;
     chat)
         info "Starting interactive chat …"
-        python -m quantstar chat
+        python -m quantstar --vram "$VRAM_GB" chat
         ;;
     info)
-        python -m quantstar info
+        python -m quantstar --vram "$VRAM_GB" info
         ;;
     init)
         info "Registering QuantStar in OpenCode config …"
-        python -m quantstar init
+        python -m quantstar --vram "$VRAM_GB" init
         ;;
     *)
-        echo "Usage: ./run.sh [download|serve|chat|info|init]"
+        echo "Usage: ./run.sh [download|bake|serve|chat|info|init]"
         echo ""
-        echo "  download  — download Qwen3.6-27B from HuggingFace"
+        echo "  download  — download model from HuggingFace"
+        echo "  bake      — quantize visual encoder and save cooked model (8 GB tier only)"
         echo "  serve     — start OpenAI-compatible API server"
         echo "  chat      — start interactive CLI chat"
         echo "  info      — show configuration"

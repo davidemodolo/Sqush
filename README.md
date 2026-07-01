@@ -1,8 +1,8 @@
 # QuantStar
 
-**Run Qwen3.6-27B on a single 24GB GPU.**
+**Run Qwen models quantized on a single GPU — 8 GB or 24 GB VRAM.**
 
-4-bit weights + 4-bit KV cache + blockwise attention = 256k context in ~22 GB VRAM.
+4-bit weights + 4-bit KV cache + blockwise attention.
 Multimodal text + image input. Drop-in OpenAI-compatible API. Local, private, zero config.
 
 ## Features
@@ -15,6 +15,28 @@ Multimodal text + image input. Drop-in OpenAI-compatible API. Local, private, ze
 - **Image input** - Qwen3.6-VL vision encoder processes images via `image_url` content parts (base64 data URLs)
 - **Interactive CLI** - Rich-based chat with session reuse, `/clear`, `/vram`, `/system` commands
 - **Session KV reuse** - subsequent requests sharing the same prompt prefix skip redundant prefill
+
+## VRAM Tiers
+
+QuantStar auto-detects your GPU and picks the right model and settings:
+
+| VRAM | Model | Download | Context | Weight Bits | KV Bits |
+|------|-------|----------|---------|-------------|---------|
+| 8 GB | Qwen3.5-9B (pre-quantized) | 8.6 GB | 128k | 4-bit NF4 | 4-bit int4 |
+| 24 GB | Qwen3.6-27B | 52 GB | 256k | 4-bit NF4 | 4-bit int4 |
+
+Override auto-detection with `--vram`:
+
+```bash
+./run.sh --vram 8 serve      # force 8GB profile
+python -m quantstar --vram 8 serve
+```
+
+The 8 GB tier uses [`techwithsergiu/Qwen3.5-9B-bnb-4bit`](https://huggingface.co/techwithsergiu/Qwen3.5-9B-bnb-4bit) — a pre-quantized bitsandbytes NF4 checkpoint, just 8.6 GB to download. On first run, QuantStar *bakes* it: the embedding table (`embed_tokens`, 1.93 GB in bfloat16) is quantized to 4-bit per-group asymmetric format and saved as a side-car file. The baked model is cached; subsequent starts load it directly. bitsandbytes does not quantize `nn.Embedding` layers, so QuantStar handles that itself. The `lm_head` projection (another 2.03 GB in bfloat16, kept unquantized by the upstream checkpoint) is quantized to NF4 at load time, saving a further ~1.45 GB. Together this keeps loading and inference well within the 8 GB budget, leaving headroom for long contexts.
+
+Image inputs on the 8 GB tier are capped at 131,072 pixels (≈ 362 × 362) before being passed to the vision encoder. Images larger than this are downscaled to fit. This is necessary because the vision encoder's self-attention over image patches generates large bfloat16 activation tensors — at full 1024 × 1024 resolution (4096 patches) this exceeds the VRAM budget regardless of weight quantization. At the cap, the vision encoder sees 512 patches instead of 4096, keeping activation memory within budget.
+
+The 24 GB tier downloads the full Qwen3.6-27B model and quantizes it at load time using bitsandbytes NF4.
 
 ## Quickstart
 
@@ -141,7 +163,9 @@ Images are processed by Qwen3.6-VL's vision encoder via chunked prefill. The res
 
 ## Text Performance
 
-Measured on RTX 3090 24GB, Python 3.14, torch 2.12.1+cu126:
+All benchmarks: Python 3.14, torch 2.12.1+cu126, 4-bit NF4 weights, int4 KV cache.
+
+### Qwen3.6-27B (24 GB VRAM, RTX 3090)
 
 | Context | Peak VRAM | Prefill | Decode |
 |---------|-----------|---------|--------|
@@ -154,6 +178,19 @@ Measured on RTX 3090 24GB, Python 3.14, torch 2.12.1+cu126:
 
 Weights: ~16.5 GB (NF4). KV cache: ~4.3 GB at 256k (int4, append-only). Headroom: ~2 GB.
 
+### Qwen3.5-9B (8 GB VRAM, RTX 4060 Ti)
+
+| Target | Actual | Prefill | Decode | Peak VRAM |
+|--------|--------|---------|--------|-----------|
+| 3,000 | 2,986 | 1.4s | 19.5t/s | 5.6 GB |
+| 16,000 | 15,986 | 8.9s | 12.4t/s | 5.7 GB |
+| 32,000 | 31,986 | 22.5s | 8.6t/s | 5.8 GB |
+| 64,000 | 63,986 | 61.9s | 5.3t/s | 6.1 GB |
+| 128,000 | 127,986 | 185.9s | 3.0t/s | 6.6 GB |
+| 256,000 | 255,986 | 661.9s | 1.3t/s | 7.6 GB |
+
+Weights: ~5.5 GB (NF4 + embedding quantization). KV cache: ~2.0 GB at 256k. 256k fits within 8 GB VRAM.
+
 Decode speed drops with context length because blockwise attention iterates over all cached blocks per token, dequantizing each block on the fly. At low context it's fast; at 256k it's compute-bound by the Python dispatch overhead. Future work: Triton kernel to fuse dequant + attention in a single pass.
 
 ## Session KV reuse
@@ -161,6 +198,8 @@ Decode speed drops with context length because blockwise attention iterates over
 The server keeps the KV cache alive between requests in the same session. If your next request appends to the same conversation, prefill is skipped — only the new tokens are processed. This makes multi-turn chat fast after the first message.
 
 This applies to both text-only and vision conversations. When an image appears in the conversation history, the vision encoder runs once for that turn and the resulting KV states are cached; subsequent text follow-ups extend the same cache rather than re-processing the image.
+
+Reuse is verified at the token level: the new prompt must start with exactly the tokens the cache was built from. For a hit on thinking turns, the client must send the previous reply's reasoning back (`reasoning_content` on the assistant message, as returned by the API) — if the reasoning is dropped, the re-rendered history no longer matches the cached tokens and prefill restarts from scratch.
 
 **Constraint:** one concurrent conversation per server instance. If you send a request that doesn't share the prefix (editing a prior message, switching conversations, or a shorter history than what was cached), the cache is invalidated and prefill restarts. For multiple independent sessions, run multiple server instances on different ports.
 

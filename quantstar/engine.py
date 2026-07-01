@@ -14,6 +14,16 @@ log = logging.getLogger(__name__)
 PREFILL_CHUNK = 1024  # tokens per prefill chunk — bounds the FLA linear-attention transient
 
 
+def _vram_str() -> str:
+    """GPU memory as 'alloc/reserved' — reserved is what nvidia-smi shows (minus
+    the ~0.3 GB CUDA context); allocated alone understates real usage."""
+    if not torch.cuda.is_available():
+        return "n/a"
+    alloc = torch.cuda.memory_allocated() / (1024**3)
+    reserved = torch.cuda.memory_reserved() / (1024**3)
+    return f"{alloc:.1f} GB alloc / {reserved:.1f} GB reserved"
+
+
 def _safe_messages(messages: list[dict]) -> list[dict]:
     """Preprocess messages: Qwen3.6 template expects tool_call.arguments as dict,
     but OpenAI API sends them as JSON strings. Convert to dict to avoid Jinja2
@@ -82,6 +92,8 @@ class InferenceEngine:
         top_p: float = 0.8,
         top_k: int = 20,
         presence_penalty: float = 1.5,
+        max_image_pixels: Optional[int] = None,
+        min_image_pixels: Optional[int] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -93,9 +105,16 @@ class InferenceEngine:
         self.top_p = top_p
         self.top_k = top_k
         self.presence_penalty = presence_penalty
+        self.max_image_pixels = max_image_pixels
+        self.min_image_pixels = min_image_pixels
         self._last_prompt_tokens = 0
         self._session_kv = None
         self._session_num_messages = 0
+        # Tokens the session KV cache was built from (full sequence of the last
+        # turn). Reuse requires the new prompt to start with exactly these tokens
+        # — length/message-count heuristics silently corrupt the cache when the
+        # re-rendered history diverges (e.g. thinking blocks stripped).
+        self._session_ids: Optional[torch.Tensor] = None
 
     def _chunked_prefill(self, input_ids: torch.Tensor,
                          cache: object = None) -> tuple[object, torch.Tensor]:
@@ -123,8 +142,7 @@ class InferenceEngine:
             cache = out.past_key_values
             offset = end
             if torch.cuda.is_available():
-                alloc = torch.cuda.memory_allocated() / (1024**3)
-                log.info(f"prefill {offset}/{total_len} tokens, VRAM={alloc:.1f} GB")
+                log.info(f"prefill {offset}/{total_len} tokens, VRAM: {_vram_str()}")
 
         return cache, input_ids
 
@@ -150,18 +168,25 @@ class InferenceEngine:
 
         total_len = input_ids.shape[1]
 
-        # Reuse existing session cache when new prompt extends previous one.
-        # Compare message counts instead of raw token IDs — the chat template
-        # may re-tokenize the same conversation prefix slightly differently.
-        if self._session_kv is not None and self._session_num_messages > 0 and num_messages > self._session_num_messages:
-            cache_seq_len = getattr(self._session_kv, "get_seq_length", lambda _: 0)(0)
-            if cache_seq_len > 0 and total_len > cache_seq_len:
+        # Reuse the session cache only when the new prompt is an exact token-level
+        # extension of the cached sequence. get_seq_length() is the true KV length
+        # (one less than the last turn's full sequence — the final generated token
+        # is never fed back), so slicing there re-prefills exactly the missing part.
+        if self._session_kv is not None and self._session_ids is not None:
+            cache_seq_len = self._session_kv.get_seq_length()
+            if (0 < cache_seq_len < total_len
+                    and cache_seq_len <= self._session_ids.shape[0]
+                    and torch.equal(input_ids[0, :cache_seq_len],
+                                    self._session_ids[:cache_seq_len].to(input_ids.device))):
                 new_tokens = input_ids[:, cache_seq_len:]
                 if new_tokens.shape[1] > 1:
                     self._session_kv, _ = self._chunked_prefill(new_tokens, cache=self._session_kv)
                 kwargs["past_key_values"] = self._session_kv
                 self._session_num_messages = num_messages
+                log.info("Session KV reuse: %d cached + %d new tokens", cache_seq_len, total_len - cache_seq_len)
                 return kwargs, input_ids
+            log.info("Session KV miss: cached %d tokens do not prefix the new %d-token prompt — full prefill",
+                     cache_seq_len, total_len)
 
         if total_len > PREFILL_CHUNK:
             self._session_kv, _ = self._chunked_prefill(input_ids)
@@ -187,7 +212,11 @@ class InferenceEngine:
             t_proc = time.perf_counter()
             image_sizes = [(img.width, img.height) for img in images]
             log.info("_tokenize: processing %d image(s) sizes=%s", len(images), image_sizes)
-            inputs = self.processor(text=[text], images=images, return_tensors="pt", padding=True)
+            proc_kwargs = {"return_tensors": "pt", "padding": True}
+            if self.max_image_pixels is not None and self.min_image_pixels is not None:
+                proc_kwargs["max_pixels"] = self.max_image_pixels
+                proc_kwargs["min_pixels"] = self.min_image_pixels
+            inputs = self.processor(text=[text], images=images, **proc_kwargs)
             d = inputs.data if hasattr(inputs, "data") else inputs
             input_ids = d["input_ids"].to(self.model.device)
             pixel_values = d.get("pixel_values")
@@ -202,12 +231,11 @@ class InferenceEngine:
             n_image_tokens = int((input_ids == self.model.config.image_token_id).sum()) if self.model.config.image_token_id else 0
             dt = time.perf_counter() - t_proc
             if torch.cuda.is_available():
-                vram = torch.cuda.memory_allocated() / (1024**3)
-                log.info("_tokenize: processor+move took %.2fs, input_ids=%s, pixel_values=%s, grid_thw=%s, image_tokens=%d, VRAM=%.1f GB",
+                log.info("_tokenize: processor+move took %.2fs, input_ids=%s, pixel_values=%s, grid_thw=%s, image_tokens=%d, VRAM: %s",
                          dt, input_ids.shape,
                          pixel_values.shape if pixel_values is not None else None,
                          image_grid_thw.shape if image_grid_thw is not None else None,
-                         n_image_tokens, vram)
+                         n_image_tokens, _vram_str())
             else:
                 log.info("_tokenize: processor+move took %.2fs, input_ids=%s, pixel_values=%s, grid_thw=%s, image_tokens=%d",
                          dt, input_ids.shape,
@@ -224,21 +252,23 @@ class InferenceEngine:
         model_inner = self.model.model
 
         with torch.no_grad():
-            vram_log = lambda tag: log.info("vision vram %s: %.1f GB", tag,
-                                            torch.cuda.memory_allocated() / (1024**3)) if torch.cuda.is_available() else None
+            vram_log = lambda tag: log.info("vision vram %s: %s", tag,
+                                            _vram_str()) if torch.cuda.is_available() else None
 
             inputs_embeds = model_inner.get_input_embeddings()(input_ids)
 
             image_outputs = model_inner.get_image_features(pixel_values, image_grid_thw)
             image_embeds = image_outputs.pooler_output
             image_embeds = torch.cat(image_embeds, dim=0).to(device=input_ids.device, dtype=inputs_embeds.dtype)
+            del image_outputs
+            torch.cuda.empty_cache()
             vram_log("after vision encoder")
 
             image_mask, _ = model_inner.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-            del image_outputs, image_embeds, image_mask
+            del image_embeds, image_mask
             vram_log("after merge")
 
             position_ids = model_inner.compute_3d_position_ids(
@@ -262,8 +292,7 @@ class InferenceEngine:
                 )
                 cache = out.past_key_values
                 offset = end
-                log.info("vision prefill %d/%d tokens, VRAM=%.1f GB", offset, total_len,
-                         torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0)
+                log.info("vision prefill %d/%d tokens, VRAM: %s", offset, total_len, _vram_str())
 
             if hasattr(model_inner, "rope_deltas"):
                 model_inner.rope_deltas = None
@@ -302,15 +331,15 @@ class InferenceEngine:
 
         if has_new_images:
             self._session_kv = None
+            self._session_ids = None
             _temperature = temperature if temperature is not None else self.temperature
             _top_p = top_p if top_p is not None else self.top_p
 
             cache = self.cache_factory() if self.cache_factory is not None else None
 
-            vram_before = vram_after = peak = 0.0
+            vram_before = _vram_str()
             if torch.cuda.is_available():
-                vram_before = torch.cuda.memory_allocated() / (1024**3)
-                log.info("Vision prefill starting: %d tokens, int4 cache=%s, VRAM=%.1f GB",
+                log.info("Vision prefill starting: %d tokens, int4 cache=%s, VRAM: %s",
                          input_ids.shape[1], cache is not None, vram_before)
 
             t0 = time.perf_counter()
@@ -318,8 +347,7 @@ class InferenceEngine:
             prefill_s = time.perf_counter() - t0
 
             if torch.cuda.is_available():
-                vram_prefill = torch.cuda.memory_allocated() / (1024**3)
-                log.info("Vision prefill done: %.2fs, VRAM=%.1f GB", prefill_s, vram_prefill)
+                log.info("Vision prefill done: %.2fs, VRAM: %s", prefill_s, _vram_str())
 
             generate_kwargs = {
                 "past_key_values": cache,
@@ -333,26 +361,25 @@ class InferenceEngine:
             }
 
             if torch.cuda.is_available():
-                log.info("Vision generate start: VRAM=%.1f GB", torch.cuda.memory_allocated() / (1024**3))
+                log.info("Vision generate start: VRAM: %s", _vram_str())
 
             t0 = time.perf_counter()
             with torch.no_grad():
                 outputs = self.model.generate(input_ids, return_dict_in_generate=True, **generate_kwargs)
             elapsed = time.perf_counter() - t0
 
-            if torch.cuda.is_available():
-                vram_after = torch.cuda.memory_allocated() / (1024**3)
-                peak = torch.cuda.max_memory_allocated() / (1024**3)
+            peak = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
 
             n_input = input_ids.shape[1]
             generated_ids = outputs.sequences[0][n_input:]
             text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
             n_tokens = len(generated_ids)
-            log.info("Vision: %d tokens in %.2fs (prefill=%.2fs), VRAM before=%.1f after=%.1f peak=%.1f GB",
-                     n_tokens, elapsed, prefill_s, vram_before, vram_after, peak)
+            log.info("Vision: %d tokens in %.2fs (prefill=%.2fs), VRAM before=%s after=%s peak_alloc=%.1f GB",
+                     n_tokens, elapsed, prefill_s, vram_before, _vram_str(), peak)
             # Save KV so follow-up text turns can extend it instead of full re-prefill.
             if outputs.past_key_values is not None:
                 self._session_kv = outputs.past_key_values
+                self._session_ids = outputs.sequences[0]
             self._session_num_messages = len(messages)
             return text, n_input, n_tokens
 
@@ -371,6 +398,7 @@ class InferenceEngine:
 
         if outputs.past_key_values is not None:
             self._session_kv = outputs.past_key_values
+            self._session_ids = outputs.sequences[0]
 
         return text, input_ids.shape[1], n_tokens
 
@@ -404,14 +432,15 @@ class InferenceEngine:
 
         if has_new_images:
             self._session_kv = None
+            self._session_ids = None
             _temperature = temperature if temperature is not None else self.temperature
             _top_p = top_p if top_p is not None else self.top_p
 
             cache = self.cache_factory() if self.cache_factory is not None else None
 
+            vram_before = _vram_str()
             if torch.cuda.is_available():
-                vram_before = torch.cuda.memory_allocated() / (1024**3)
-                log.info("Vision prefill starting (stream): %d tokens, int4 cache=%s, VRAM=%.1f GB",
+                log.info("Vision prefill starting (stream): %d tokens, int4 cache=%s, VRAM: %s",
                          input_ids.shape[1], cache is not None, vram_before)
 
             t0 = time.perf_counter()
@@ -419,8 +448,7 @@ class InferenceEngine:
             prefill_s = time.perf_counter() - t0
 
             if torch.cuda.is_available():
-                vram_prefill = torch.cuda.memory_allocated() / (1024**3)
-                log.info("Vision prefill done (stream): %.2fs, VRAM=%.1f GB", prefill_s, vram_prefill)
+                log.info("Vision prefill done (stream): %.2fs, VRAM: %s", prefill_s, _vram_str())
 
             streamer = TextIteratorStreamer(
                 self.tokenizer,
@@ -440,7 +468,7 @@ class InferenceEngine:
             }
 
             if torch.cuda.is_available():
-                log.info("Vision generate start (stream): VRAM=%.1f GB", torch.cuda.memory_allocated() / (1024**3))
+                log.info("Vision generate start (stream): VRAM: %s", _vram_str())
 
             vision_out: dict = {}
             def _vision_generate():
@@ -454,12 +482,12 @@ class InferenceEngine:
             thread.join()
 
             if torch.cuda.is_available():
-                vram_after = torch.cuda.memory_allocated() / (1024**3)
                 peak = torch.cuda.max_memory_allocated() / (1024**3)
-                log.info("Vision stream done: VRAM before=%.1f after=%.1f peak=%.1f GB", vram_before, vram_after, peak)
+                log.info("Vision stream done: VRAM before=%s after=%s peak_alloc=%.1f GB", vram_before, _vram_str(), peak)
             _out = vision_out.get("result")
             if _out is not None and _out.past_key_values is not None:
                 self._session_kv = _out.past_key_values
+                self._session_ids = _out.sequences[0]
             self._session_num_messages = len(messages)
             return
 
@@ -487,10 +515,12 @@ class InferenceEngine:
         outputs = output_ids["data"]
         if outputs.past_key_values is not None:
             self._session_kv = outputs.past_key_values
+            self._session_ids = outputs.sequences[0]
 
     def reset_session(self) -> None:
         self._session_kv = None
         self._session_num_messages = 0
+        self._session_ids = None
 
     def get_vram_info(self) -> dict:
         if not torch.cuda.is_available():

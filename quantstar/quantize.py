@@ -589,10 +589,127 @@ def _make_cache_factory(model):
         return None
 
 
+def _model_is_pre_quantized(model_path: str) -> bool:
+    import json
+    import os
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+            qc = cfg.get("quantization_config", {})
+            return qc.get("quant_method") == "bitsandbytes"
+        except Exception:
+            pass
+    return False
+
+
+# The Qwen3.5-9B checkpoint's chat template unconditionally strips prior-turn
+# <think> blocks (the Qwen3.6-27B template gained a `preserve_thinking` escape
+# hatch). Stripping breaks session KV reuse: the re-rendered prompt no longer
+# matches the tokens the cache was built from, so every follow-up turn misses.
+# Patch the template in memory to honor preserve_thinking, matching the 27B.
+_TEMPLATE_STRIP_THINKING = "{%- if loop.index0 > ns.last_query_index %}"
+_TEMPLATE_PRESERVE_THINKING = (
+    "{%- if (preserve_thinking is defined and preserve_thinking is true) "
+    "or (loop.index0 > ns.last_query_index) %}"
+)
+
+
+def _patch_chat_template_preserve_thinking(tokenizer) -> None:
+    tpl = getattr(tokenizer, "chat_template", None)
+    if isinstance(tpl, str) and "preserve_thinking" not in tpl and _TEMPLATE_STRIP_THINKING in tpl:
+        tokenizer.chat_template = tpl.replace(_TEMPLATE_STRIP_THINKING, _TEMPLATE_PRESERVE_THINKING)
+        log.info("Patched chat template to honor preserve_thinking (required for session KV reuse)")
+
+
+def _quantize_lm_head(model: torch.nn.Module) -> None:
+    """Quantize lm_head to NF4 after loading.
+
+    lm_head is a 248320×4096 bfloat16 tensor (2.03 GB); NF4 (~0.57 GB) saves ~1.45 GB
+    on the 8 GB tier. It MUST stay in llm_int8_skip_modules: on a pre-quantized
+    checkpoint, from_pretrained expects any Linear4bit module's weights to already be
+    packed 4-bit + quant_state in the shard — removing lm_head from the skip list
+    makes it load the raw bfloat16 weight into a Linear4bit with no quant_state and
+    bitsandbytes asserts on the first forward. So we load it as a plain bf16
+    nn.Linear and quantize it here, the same post-load approach as
+    _quantize_visual_encoder.
+    """
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        log.warning("bitsandbytes not available — skipping lm_head quantization")
+        return
+    if not torch.cuda.is_available():
+        log.warning("CUDA not available — skipping lm_head quantization (NF4 requires CUDA)")
+        return
+
+    head = getattr(model, "lm_head", None)
+    if not isinstance(head, torch.nn.Linear) or isinstance(head, bnb.nn.Linear4bit):
+        return
+
+    target_device = head.weight.device
+    out_f, in_f = head.weight.shape
+    w_cpu = head.weight.data.cpu().to(torch.float16)
+    b_cpu = head.bias.data.cpu() if head.bias is not None else None
+    # Free the 2 GB bfloat16 GPU tensor before quantizing so the transient stays low.
+    head.weight.data = torch.empty(0, device="cpu")
+    if head.bias is not None:
+        head.bias.data = torch.empty(0, device="cpu")
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    new = bnb.nn.Linear4bit(
+        in_f, out_f,
+        bias=b_cpu is not None,
+        compute_dtype=torch.bfloat16,
+        compress_statistics=True,
+        quant_type="nf4",
+    )
+    new.weight = bnb.nn.Params4bit(
+        w_cpu, requires_grad=False, quant_type="nf4", compress_statistics=True,
+    )
+    if b_cpu is not None:
+        new.bias = torch.nn.Parameter(b_cpu.to(target_device), requires_grad=False)
+    new = new.to(target_device if target_device.type == "cuda" else "cuda:0")  # .to(cuda) triggers NF4 quantization
+
+    model.lm_head = new
+    del w_cpu, b_cpu
+    gc.collect()
+    torch.cuda.empty_cache()
+    log.info("Quantized lm_head to NF4 (%d × %d, ~2.0 GB bf16 → ~0.57 GB)", out_f, in_f)
+
+
+def _patch_quant_config_for_visual_encoder(model: torch.nn.Module) -> None:
+    """Remove visual encoder modules from bitsandbytes skip list.
+
+    When saving a cooked model, this ensures the visual encoder's Linear4bit
+    layers are included in the quantization_config so from_pretrained reloads
+    them with the correct layer type (not nn.Linear).
+    """
+    qc = getattr(getattr(model, "config", None), "quantization_config", None)
+    if qc is None:
+        return
+    skip = getattr(qc, "llm_int8_skip_modules", None)
+    if not skip:
+        return
+    visual_prefixes = ("visual", "vision_model", "vision_tower", "img_processor")
+    updated = [m for m in skip if not any(m.startswith(p) for p in visual_prefixes)]
+    if len(updated) != len(skip):
+        log.info(
+            "Patched quantization_config: removed %d visual encoder entries from skip_modules",
+            len(skip) - len(updated),
+        )
+        qc.llm_int8_skip_modules = updated
+
+
 def load_and_quantize_model(
     model_path: str,
     attn_implementation: str = "sdpa",
     torch_dtype_str: str = "bfloat16",
+    quantize_embeddings: bool = False,
+    quantize_vision_encoder: bool = False,
+    device_map: "str | dict" = "cuda:0",
 ) -> tuple[torch.nn.Module, object, object, Optional[object]]:
     from transformers import AutoModelForImageTextToText, AutoTokenizer, BitsAndBytesConfig
 
@@ -600,25 +717,54 @@ def load_and_quantize_model(
 
     _print_memory_usage("before model load")
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=dtype,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
+    already_quantized = _model_is_pre_quantized(model_path)
 
-    # AutoModelForImageTextToText resolves to Qwen3_5ForConditionalGeneration for Qwen3.6,
-    # loading the full VL model (language + vision encoder). Load with sdpa then
-    # switch to our custom "quantstar" attention.
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_path,
-        quantization_config=bnb_config,
-        device_map="cuda:0",
-        attn_implementation=attn_implementation,
-        trust_remote_code=True,
-    )
+    if already_quantized:
+        from transformers import AutoConfig
+        model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+        pre_baked = getattr(model_config, "qs_pre_baked_embeddings", False)
+        if pre_baked:
+            # embed_tokens.weight was removed from the cooked safetensors during bake
+            # and its 4-bit form saved to quantized_embeddings.safetensors. Route
+            # embed_tokens to CPU so from_pretrained never allocates the 1.93 GB
+            # bfloat16 tensor on GPU — this prevents CUDA allocator fragmentation that
+            # would otherwise lock 2 GB in reserve permanently. The module is replaced
+            # with QuantizedEmbedding on GPU immediately after loading.
+            device_map = {"model.language_model.embed_tokens": "cpu", "": "cuda:0"}
+
+        if isinstance(device_map, dict):
+            qc = getattr(model_config, "quantization_config", None)
+            if isinstance(qc, dict):
+                qc["llm_int8_enable_fp32_cpu_offload"] = True
+            elif qc is not None:
+                qc.llm_int8_enable_fp32_cpu_offload = True
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            config=model_config,
+            device_map=device_map,
+            attn_implementation=attn_implementation,
+            trust_remote_code=True,
+            ignore_mismatched_sizes=pre_baked,
+        )
+        log.info("Loaded pre-quantized bitsandbytes model from disk")
+    else:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            quantization_config=bnb_config,
+            device_map=device_map,
+            attn_implementation=attn_implementation,
+            trust_remote_code=True,
+        )
+        log.info("Loaded with bitsandbytes 4-bit NF4 quantization (attn=quantstar blockwise GQA)")
+
     model.config._attn_implementation = "quantstar"
-    log.info("Loaded with bitsandbytes 4-bit NF4 quantization (attn=quantstar blockwise GQA)")
 
     _print_memory_usage("after model load")
 
@@ -629,11 +775,274 @@ def load_and_quantize_model(
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    _patch_chat_template_preserve_thinking(tokenizer)
 
     from transformers.models.qwen3_vl import Qwen3VLProcessor
     processor = Qwen3VLProcessor.from_pretrained(model_path)
+
+    # Quantize the VL visual encoder and embeddings to 4-bit.
+    # bitsandbytes leaves these in bfloat16 (~3.4 GB for visual encoder, ~1 GB for embeddings).
+    if quantize_vision_encoder:
+        _quantize_visual_encoder(model)
+        gc.collect()
+        torch.cuda.empty_cache()
+        _print_memory_usage("after visual encoder quantization")
+    if quantize_embeddings and not (already_quantized and getattr(model.config, "qs_pre_baked_embeddings", False)):
+        _quantize_embeddings(model)
+        gc.collect()
+        torch.cuda.empty_cache()
+        _print_memory_usage("after embedding quantization")
+    if already_quantized and getattr(model.config, "qs_pre_baked_embeddings", False):
+        _load_pre_baked_embeddings(model, model_path)
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        _print_memory_usage("after pre-baked embedding load")
+        _quantize_lm_head(model)
+        _print_memory_usage("after lm_head quantization")
 
     cache_factory = _make_cache_factory(model)
 
     model.eval()
     return model, tokenizer, processor, cache_factory
+
+
+# ---------------------------------------------------------------------------
+# Embedding quantization — saves ~1.5 GB on the 248k×4096 vocab table
+# ---------------------------------------------------------------------------
+
+_EMBED_GROUP_SIZE = 128
+
+
+class QuantizedEmbedding(torch.nn.Module):
+    """4-bit quantized embedding with per-group asymmetric quantization.
+
+    Only dequantizes the rows accessed by the input indices, not the full table.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, qweight: torch.Tensor,
+                 scales: torch.Tensor, zero_points: torch.Tensor):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.register_buffer("_qw", qweight)
+        self.register_buffer("_sc", scales)
+        self.register_buffer("_zp", zero_points)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        n = indices.numel()
+        if n == 0:
+            return torch.empty(0, self.embedding_dim, device=indices.device, dtype=torch.bfloat16)
+
+        num_groups = (self.embedding_dim + _EMBED_GROUP_SIZE - 1) // _EMBED_GROUP_SIZE
+        padded = num_groups * _EMBED_GROUP_SIZE
+
+        flat = indices.flatten()
+        device = indices.device
+
+        qw = self._qw[flat]  # [n, num_groups, 16]
+        sc = self._sc[flat]  # [n, num_groups]
+        zp = self._zp[flat]  # [n, num_groups]
+        shift = torch.arange(8, device=device, dtype=torch.int32)
+        # qw: [n, num_groups, 16] → unpack → [n, num_groups, 128]
+        vals = (qw.unsqueeze(-1) >> (shift * 4)) & 0xF  # [n, num_groups, 16, 8]
+        vals = vals.reshape(n, num_groups, _EMBED_GROUP_SIZE)
+
+        w = ((vals.to(torch.bfloat16) - zp.unsqueeze(-1).to(torch.bfloat16))
+             * sc.unsqueeze(-1).to(torch.bfloat16))
+        w = w[:, :, : self.embedding_dim]
+        return w.reshape(*indices.shape, self.embedding_dim)
+
+
+def _quantize_visual_encoder(model: torch.nn.Module) -> None:
+    """Quantize all remaining bfloat16 Linear layers (the VL visual encoder) to 4-bit NF4.
+
+    In a pre-quantized bitsandbytes model all LM Linear layers are already
+    bnb.nn.Linear4bit. Any remaining nn.Linear layers are the visual encoder
+    that bitsandbytes skipped. Walking the full module tree avoids depending
+    on a specific attribute path (e.g. model.model.visual varies by arch).
+
+    If the model was loaded with accelerate CPU-offload (device_map with cpu entries),
+    weights appear as meta tensors. We materialise them via remove_hook_from_module
+    before quantising, then quantise on GPU and store NF4 back on CPU for saving.
+    """
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        log.warning("bitsandbytes not available — skipping visual encoder quantization")
+        return
+
+    # Materialise any accelerate CPU-offloaded meta tensors so we can read their data.
+    try:
+        from accelerate.hooks import remove_hook_from_module
+        remove_hook_from_module(model, recurse=True)
+    except Exception:
+        pass
+
+    replacements: list[tuple[torch.nn.Module, str, torch.nn.Module]] = []
+    for module in model.modules():
+        for name, child in module.named_children():
+            if isinstance(child, torch.nn.Linear) and not isinstance(child, bnb.nn.Linear4bit):
+                replacements.append((module, name, child))
+
+    if not replacements:
+        log.info("Visual encoder: all Linear layers already quantized")
+        return
+
+    n_layers = len(replacements)
+    freed_bytes = 0
+    for parent, name, child in replacements:
+        target_device = child.weight.device
+        freed_bytes += child.weight.nelement() * child.weight.element_size()
+
+        w_cpu = child.weight.data.cpu().to(torch.float16)
+        b_cpu = child.bias.data.cpu() if child.bias is not None else None
+        child.weight.data = torch.empty(0, device="cpu")
+        if child.bias is not None:
+            child.bias.data = torch.empty(0, device="cpu")
+        del child
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        new = bnb.nn.Linear4bit(
+            w_cpu.shape[1],
+            w_cpu.shape[0],
+            bias=b_cpu is not None,
+            compute_dtype=torch.bfloat16,
+            compress_statistics=True,
+            quant_type="nf4",
+        )
+        new.weight = bnb.nn.Params4bit(
+            w_cpu,
+            requires_grad=False,
+            quant_type="nf4",
+            compress_statistics=True,
+        )
+        if b_cpu is not None:
+            new.bias = torch.nn.Parameter(b_cpu.to(target_device), requires_grad=False)
+
+        # NF4 quantisation requires CUDA. If the target is CPU (bake with offloaded
+        # visual encoder), quantise on GPU then move the packed NF4 back to CPU.
+        if target_device.type == "cpu" and torch.cuda.is_available():
+            new = new.to("cuda")  # Params4bit.to("cuda") triggers NF4 quantisation
+            new = new.to("cpu")   # moves packed int4 to CPU; stays quantised
+        else:
+            new = new.to(target_device)
+
+        setattr(parent, name, new)
+        del w_cpu, b_cpu
+
+    del replacements
+    gc.collect()
+    torch.cuda.empty_cache()
+    log.info(
+        "Visual encoder: quantized %d Linear → NF4 (freed ~%.1f GB bfloat16, added ~%.1f GB int4)",
+        n_layers,
+        freed_bytes / 1e9,
+        freed_bytes / 1e9 / 4,
+    )
+
+
+def _load_pre_baked_embeddings(model: torch.nn.Module, model_path: str) -> None:
+    """Load pre-quantized embedding from quantized_embeddings.safetensors and replace embed_tokens."""
+    import os as _os
+    from safetensors.torch import load_file as _sf_load
+
+    sidecar = _os.path.join(model_path, "quantized_embeddings.safetensors")
+    if not _os.path.exists(sidecar):
+        log.warning("qs_pre_baked_embeddings is set but %s not found — skipping", sidecar)
+        return
+
+    eq = _sf_load(sidecar, device="cpu")
+    vocab   = int(eq["_vocab"].item())
+    hidden  = int(eq["_hidden"].item())
+
+    # Find the embed_tokens module by name — the visual encoder also has nn.Embedding
+    # (pos_embed) that appears earlier in named_modules(), so we must match by name.
+    target_name: str | None = None
+    for name, mod in model.named_modules():
+        if isinstance(mod, torch.nn.Embedding) and name.endswith("embed_tokens"):
+            target_name = name
+            break
+
+    if target_name is None:
+        log.warning("No nn.Embedding found in model — cannot install pre-baked embedding")
+        return
+
+    # Resolve the parent module and attribute name.
+    parts = target_name.split(".")
+    parent = model
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    attr = parts[-1]
+
+    new_emb = QuantizedEmbedding(
+        vocab, hidden,
+        eq["_qw"].to("cuda:0"),
+        eq["_sc"].to("cuda:0"),
+        eq["_zp"].to("cuda:0"),
+    )
+    setattr(parent, attr, new_emb)
+    del eq
+    log.info(
+        "Installed pre-baked QuantizedEmbedding (%d × %d) at %s",
+        vocab, hidden, target_name,
+    )
+
+
+def _quantize_embeddings(model: torch.nn.Module) -> None:
+    """Replace all nn.Embedding layers with QuantizedEmbedding."""
+    replacements = []
+
+    def _walk(module, prefix):
+        for name, child in list(module.named_children()):
+            path = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, torch.nn.Embedding):
+                replacements.append((module, name, child))
+            else:
+                _walk(child, path)
+
+    _walk(model, "")
+
+    for parent, name, child in replacements:
+        target_device = child.weight.device
+
+        # Move to CPU first, then convert dtype — doing it the other way
+        # (.to(float32).cpu()) would create a ~4 GB float32 copy on GPU before
+        # the move, which spikes VRAM to ~10 GB on top of the 5.94 GB model.
+        w = child.weight.data.cpu().to(torch.float32)
+        child.weight.data = torch.empty(0, device='cpu')
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        out_f, in_f = w.shape
+        num_groups = (in_f + _EMBED_GROUP_SIZE - 1) // _EMBED_GROUP_SIZE
+        pad = num_groups * _EMBED_GROUP_SIZE - in_f
+        if pad:
+            w = torch.nn.functional.pad(w, (0, pad), value=0)
+
+        w_f = w.reshape(out_f, num_groups, _EMBED_GROUP_SIZE)
+        w_min = w_f.amin(dim=-1)
+        w_max = w_f.amax(dim=-1)
+        scale = (w_max - w_min).clamp(min=1e-9) / 15.0
+        zp = (-w_min / scale).round().clamp(0, 15).to(torch.int32)
+        q = ((w_f / scale.unsqueeze(-1)).round() + zp.unsqueeze(-1)).clamp(0, 15).to(torch.int32)
+
+        gs = _EMBED_GROUP_SIZE
+        q = torch.nn.functional.pad(q, (0, (8 - gs % 8) % 8))
+        q = q.reshape(out_f, num_groups, -1, 8)
+        packed = torch.zeros(out_f, num_groups, q.shape[2], dtype=torch.int32)
+        for i in range(8):
+            packed |= (q[..., i] & 0xF) << (i * 4)
+
+        new = QuantizedEmbedding(
+            out_f, in_f,
+            packed.to(target_device),
+            scale.to(torch.bfloat16).to(target_device),
+            zp.to(target_device),
+        )
+        setattr(parent, name, new)
+        del w, w_f, scale, zp, q, packed, child
+    del replacements
+    gc.collect()
+    torch.cuda.empty_cache()
