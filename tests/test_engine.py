@@ -646,28 +646,33 @@ class TestSessionReuse:
         cache.get_seq_length.return_value = seq_len
         return cache
 
-    def test_6_4_new_conversation_full_prefill(self):
-        """new conversation (message count does not extend) triggers full prefill."""
+    def test_6_4_shorter_prompt_full_prefill(self):
+        """new prompt shorter than the cached sequence (new conversation) → full prefill."""
+        import torch
         engine = self._engine()
         engine._session_kv = self._mock_cache(50)
+        engine._session_ids = torch.zeros(51, dtype=torch.long)
         engine._session_num_messages = 3
 
-        # num_messages=2 is not > 3, so cache reuse is skipped
-        engine._prepare_generation(self._input_ids(length=10), num_messages=2)
+        kwargs, _ = engine._prepare_generation(self._input_ids(length=10), num_messages=2)
 
-        # Session cache replaced by full-prefill result (None since no cache_factory)
+        assert "past_key_values" not in kwargs or kwargs.get("past_key_values") is not engine._session_kv or engine._session_num_messages == 2
         assert engine._session_num_messages == 2
 
-    def test_6_5_same_message_count_full_prefill(self):
-        """same message count (edited turn) triggers full prefill, not reuse."""
+    def test_6_5_diverging_tokens_full_prefill(self):
+        """prompt that does not start with the cached tokens (edited turn) → no reuse."""
+        import torch
         engine = self._engine()
-        engine._session_kv = self._mock_cache(50)
-        engine._session_num_messages = 3
+        cache = self._mock_cache(20)
+        engine._session_kv = cache
+        engine._session_ids = torch.ones(21, dtype=torch.long)  # cached tokens are all 1s
+        engine._session_num_messages = 2
 
-        # num_messages == session num → no reuse
-        engine._prepare_generation(self._input_ids(length=10), num_messages=3)
+        # New prompt is all zeros — extends in length but tokens diverge
+        input_ids = torch.zeros(1, 25, dtype=torch.long)
+        kwargs, _ = engine._prepare_generation(input_ids, num_messages=3)
 
-        # Full prefill path was taken; num_messages updated
+        assert kwargs.get("past_key_values") is not cache
         assert engine._session_num_messages == 3
 
     def test_6_6_session_num_messages_tracked(self):
@@ -677,43 +682,49 @@ class TestSessionReuse:
         assert engine._session_num_messages == 5
 
     def test_6_8_reset_session_clears_state(self):
-        """reset_session() clears _session_kv and _session_num_messages."""
+        """reset_session() clears _session_kv, _session_num_messages, and _session_ids."""
         engine = self._engine()
         engine._session_kv = mock.MagicMock()
         engine._session_num_messages = 7
+        engine._session_ids = mock.MagicMock()
         engine.reset_session()
         assert engine._session_kv is None
         assert engine._session_num_messages == 0
+        assert engine._session_ids is None
 
-    def test_6_1_cache_reuse_when_messages_extend(self):
-        """follow-up message reuses previous KV cache."""
+    def test_6_1_cache_reuse_when_prompt_extends_cached_tokens(self):
+        """follow-up whose tokens exactly extend the cached sequence reuses the KV cache."""
         import torch
         engine = self._engine()
 
-        # Simulate a 20-token session cache with 2 messages already prefilled
-        engine._session_kv = self._mock_cache(seq_len=20)
+        cache = self._mock_cache(seq_len=20)
+        engine._session_kv = cache
+        engine._session_ids = torch.zeros(21, dtype=torch.long)
         engine._session_num_messages = 2
 
-        # New prompt is 25 tokens (extends the 20-token prefix)
-        input_ids = torch.zeros(1, 25, dtype=torch.long)
+        # New prompt is 21 tokens, first 20 identical to the cached ones (the single
+        # new token is left for generate(), so no chunked prefill runs on mocks)
+        input_ids = torch.zeros(1, 21, dtype=torch.long)
         kwargs, _ = engine._prepare_generation(input_ids, num_messages=3)
 
-        assert "past_key_values" in kwargs
+        assert kwargs.get("past_key_values") is cache
         assert engine._session_num_messages == 3
 
     def test_6_12_cache_seq_len_zero_triggers_full_prefill(self):
-        """cache with seq_len==0 falls through to full prefill."""
+        """cache.get_seq_length()==0 falls through to full prefill."""
         import torch
         engine = self._engine()
 
         # Cache exists but seq_len == 0 (e.g., just allocated, nothing prefilled)
-        engine._session_kv = self._mock_cache(seq_len=0)
+        cache = self._mock_cache(seq_len=0)
+        engine._session_kv = cache
+        engine._session_ids = torch.zeros(0, dtype=torch.long)
         engine._session_num_messages = 2
 
         input_ids = torch.zeros(1, 10, dtype=torch.long)
         kwargs, _ = engine._prepare_generation(input_ids, num_messages=3)
 
-        # Inner condition (cache_seq_len > 0) fails → full prefill path taken
+        assert kwargs.get("past_key_values") is not cache
         assert engine._session_num_messages == 3
 
     def test_6_9_vision_request_saves_session(self):
@@ -734,6 +745,38 @@ class TestSessionReuse:
 
         assert engine._session_kv is not None
         assert engine._session_num_messages == 1
+
+    def test_vision_sets_session_ids(self):
+        """vision turn must store the generated token sequence so followups can verify the prefix."""
+        engine = self._engine()
+        fake_input_ids = mock.MagicMock(shape=(1, 50))
+        engine._tokenize = lambda *a, **kw: (
+            fake_input_ids, mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
+        )
+        engine._chunked_vision_prefill = mock.MagicMock(return_value=None)
+
+        with mock.patch("quantstar.engine._extract_images", return_value=[mock.MagicMock()]):
+            engine.chat_completion_sync([{"role": "user", "content": "img"}], max_tokens=1)
+
+        assert engine._session_ids is not None
+
+    def test_vision_followup_reuses_cache_via_token_prefix(self):
+        """followup text after a vision turn reuses the cache when tokens match exactly."""
+        import torch
+        engine = self._engine()
+
+        fake_kv = mock.MagicMock()
+        fake_kv.get_seq_length.return_value = 60
+        engine._session_kv = fake_kv
+        engine._session_ids = torch.zeros(61, dtype=torch.long)
+        engine._session_num_messages = 1
+
+        # Followup prompt extends the cached 60 tokens with an identical prefix
+        # (one new token, so no chunked prefill runs on mocks)
+        input_ids = torch.zeros(1, 61, dtype=torch.long)
+        kwargs, _ = engine._prepare_generation(input_ids, num_messages=2)
+
+        assert kwargs.get("past_key_values") is fake_kv
 
     def test_6_stream_session_reuse_updates_from_generate(self):
         """stream path stores past_key_values from generate into session cache."""
@@ -783,6 +826,9 @@ class TestSessionReuse:
 
         # past_key_values from generate should be stored in _session_kv
         assert engine._session_kv is fake_cache
+        # the generated sequence must be stored for token-prefix verification on followup
+        assert engine._session_ids is not None
+        assert torch.equal(engine._session_ids, torch.zeros(5, dtype=torch.long))
 
 
 # ── tokenization kwargs ─────────────────────────────────────────

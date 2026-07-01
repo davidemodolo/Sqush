@@ -1,6 +1,6 @@
 # QuantStar
 
-**Run Qwen models quantized on a single GPU — 8 GB to 24 GB VRAM.**
+**Run Qwen models quantized on a single GPU — 8 GB or 24 GB VRAM.**
 
 4-bit weights + 4-bit KV cache + blockwise attention.
 Multimodal text + image input. Drop-in OpenAI-compatible API. Local, private, zero config.
@@ -23,7 +23,6 @@ QuantStar auto-detects your GPU and picks the right model and settings:
 | VRAM | Model | Download | Context | Weight Bits | KV Bits |
 |------|-------|----------|---------|-------------|---------|
 | 8 GB | Qwen3.5-9B (pre-quantized) | 8.6 GB | 128k | 4-bit NF4 | 4-bit int4 |
-| 16 GB | *(TBD)* | — | — | — | — |
 | 24 GB | Qwen3.6-27B | 52 GB | 256k | 4-bit NF4 | 4-bit int4 |
 
 Override auto-detection with `--vram`:
@@ -33,7 +32,11 @@ Override auto-detection with `--vram`:
 python -m quantstar --vram 8 serve
 ```
 
-The 8GB tier uses a pre-quantized bnb 4-bit model — just 8.6 GB to download (vs 19 GB full) and no on-the-fly quantization. The 24GB tier downloads the full model and quantizes at load time. The 8GB tier additionally quantizes embedding tables to 4-bit (per-group asymmetric), saving ~1.5 GB — bitsandbytes doesn't handle `nn.Embedding` layers.
+The 8 GB tier uses [`techwithsergiu/Qwen3.5-9B-bnb-4bit`](https://huggingface.co/techwithsergiu/Qwen3.5-9B-bnb-4bit) — a pre-quantized bitsandbytes NF4 checkpoint, just 8.6 GB to download. On first run, QuantStar *bakes* it: the embedding table (`embed_tokens`, 1.93 GB in bfloat16) is quantized to 4-bit per-group asymmetric format and saved as a side-car file. The baked model is cached; subsequent starts load it directly. bitsandbytes does not quantize `nn.Embedding` layers, so QuantStar handles that itself. The `lm_head` projection (another 2.03 GB in bfloat16, kept unquantized by the upstream checkpoint) is quantized to NF4 at load time, saving a further ~1.45 GB. Together this keeps loading and inference well within the 8 GB budget, leaving headroom for long contexts.
+
+Image inputs on the 8 GB tier are capped at 131,072 pixels (≈ 362 × 362) before being passed to the vision encoder. Images larger than this are downscaled to fit. This is necessary because the vision encoder's self-attention over image patches generates large bfloat16 activation tensors — at full 1024 × 1024 resolution (4096 patches) this exceeds the VRAM budget regardless of weight quantization. At the cap, the vision encoder sees 512 patches instead of 4096, keeping activation memory within budget.
+
+The 24 GB tier downloads the full Qwen3.6-27B model and quantizes it at load time using bitsandbytes NF4.
 
 ## Quickstart
 
@@ -195,6 +198,8 @@ Decode speed drops with context length because blockwise attention iterates over
 The server keeps the KV cache alive between requests in the same session. If your next request appends to the same conversation, prefill is skipped — only the new tokens are processed. This makes multi-turn chat fast after the first message.
 
 This applies to both text-only and vision conversations. When an image appears in the conversation history, the vision encoder runs once for that turn and the resulting KV states are cached; subsequent text follow-ups extend the same cache rather than re-processing the image.
+
+Reuse is verified at the token level: the new prompt must start with exactly the tokens the cache was built from. For a hit on thinking turns, the client must send the previous reply's reasoning back (`reasoning_content` on the assistant message, as returned by the API) — if the reasoning is dropped, the re-rendered history no longer matches the cached tokens and prefill restarts from scratch.
 
 **Constraint:** one concurrent conversation per server instance. If you send a request that doesn't share the prefix (editing a prior message, switching conversations, or a shorter history than what was cached), the cache is invalidated and prefill restarts. For multiple independent sessions, run multiple server instances on different ports.
 

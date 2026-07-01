@@ -21,7 +21,7 @@ VRAM_PROFILES: dict[VramTier, dict] = {
     VramTier.LOW: {
         "model": {"repo": "techwithsergiu/Qwen3.5-9B-bnb-4bit"},
         "quantization": {"weight_bits": 4, "kv_cache_bits": 4},
-        "inference": {"max_context": 131072},
+        "inference": {"max_context": 131072, "max_image_pixels": 131072, "min_image_pixels": 16384},
     },
     VramTier.MEDIUM: {
         "model": {"repo": None},
@@ -58,6 +58,8 @@ class InferenceConfig:
     top_p: float = 0.8
     top_k: int = 20
     presence_penalty: float = 1.5
+    max_image_pixels: int | None = None  # max total pixels before vision encoder; None = no limit
+    min_image_pixels: int | None = None  # min total pixels (must be set alongside max_image_pixels)
 
 
 @dataclass
@@ -103,6 +105,19 @@ def classify_vram(raw_gb: int) -> VramTier:
 def load_config(path: str = "config.yaml", vram_gb: int | None = None) -> QuantStarConfig:
     cfg = QuantStarConfig()
 
+    if vram_gb is None:
+        vram_gb = detect_vram()
+
+    tier = classify_vram(vram_gb)
+    cfg.vram_tier = tier
+    profile = VRAM_PROFILES.get(tier)
+    if profile is not None:
+        for section, overrides in profile.items():
+            target = getattr(cfg, section)
+            for k, v in overrides.items():
+                if v is not None and hasattr(target, k):
+                    setattr(target, k, v)
+
     if os.path.exists(path):
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
@@ -127,19 +142,6 @@ def load_config(path: str = "config.yaml", vram_gb: int | None = None) -> QuantS
             for k, v in raw["logging"].items():
                 if hasattr(cfg.logging, k):
                     setattr(cfg.logging, k, v)
-
-    if vram_gb is None:
-        vram_gb = detect_vram()
-
-    tier = classify_vram(vram_gb)
-    cfg.vram_tier = tier
-    profile = VRAM_PROFILES.get(tier)
-    if profile is not None:
-        for section, overrides in profile.items():
-            target = getattr(cfg, section)
-            for k, v in overrides.items():
-                if v is not None and hasattr(target, k):
-                    setattr(target, k, v)
 
     for key, value in os.environ.items():
         if key == "QUANTSTAR_MODEL_REPO":

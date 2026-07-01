@@ -30,7 +30,7 @@ def run_cli(engine: InferenceEngine, config: QuantStarConfig):
     console.print(f"  max context: {config.inference.max_context}")
     vram = engine.get_vram_info()
     if vram["cuda_available"]:
-        console.print(f"  VRAM: {vram['allocated_gb']:.1f}/{vram['total_gb']:.0f} GB allocated")
+        console.print(f"  VRAM: {vram['used_gb']:.1f}/{vram['total_gb']:.0f} GB used ({vram['allocated_gb']:.1f} GB tensors)")
     console.print()
     console.print("  Commands: [bold]/quit[/], [bold]/clear[/], [bold]/system <msg>[/], [bold]/vram[/]")
     console.print()
@@ -55,7 +55,10 @@ def run_cli(engine: InferenceEngine, config: QuantStarConfig):
         elif user_input == "/vram":
             vram = engine.get_vram_info()
             if vram["cuda_available"]:
-                console.print(f"  VRAM: {vram['allocated_gb']:.1f} GB allocated / {vram['total_gb']:.0f} GB total")
+                console.print(
+                    f"  VRAM: {vram['used_gb']:.1f} GB used / {vram['total_gb']:.0f} GB total "
+                    f"({vram['allocated_gb']:.1f} GB tensors, {vram['reserved_gb']:.1f} GB reserved)"
+                )
             continue
         elif user_input.startswith("/system "):
             system_text = user_input[8:]
@@ -70,13 +73,23 @@ def run_cli(engine: InferenceEngine, config: QuantStarConfig):
         console.print()
         raw = "".join(engine.chat_completion_stream(messages))
 
-        think_start = raw.find("<think>")
-        if think_start != -1:
-            think_end = raw.find("</think>", think_start)
-            if think_end != -1:
-                raw = raw[think_end + len("</think>"):].strip()
+        # The chat template pre-opens the <think> block, so the generated text
+        # contains the reasoning followed by '</think>' (no opening tag).
+        reasoning = None
+        if "</think>" in raw:
+            reasoning, _, content = raw.partition("</think>")
+            reasoning = reasoning.split("<think>")[-1].strip()
+            content = content.strip()
+        else:
+            content = raw.strip()
 
-        if raw:
-            console.print(raw)
-            messages.append({"role": "assistant", "content": raw})
+        if content or reasoning:
+            if content:
+                console.print(content)
+            msg = {"role": "assistant", "content": content}
+            # Keep the reasoning in history: session KV reuse requires the
+            # re-rendered prompt to match the cached tokens exactly.
+            if reasoning:
+                msg["reasoning_content"] = reasoning
+            messages.append(msg)
         console.print()

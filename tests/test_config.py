@@ -206,3 +206,76 @@ class TestEnvVarConfig:
             assert cfg.server.port == 1234
         finally:
             os.unlink(path)
+
+
+class TestVramTier:
+    """VRAM tier classification and profile application."""
+
+    def test_8gb_is_low(self):
+        from quantstar.config import classify_vram, VramTier
+        assert classify_vram(8) == VramTier.LOW
+
+    def test_16gb_is_medium(self):
+        from quantstar.config import classify_vram, VramTier
+        assert classify_vram(16) == VramTier.MEDIUM
+
+    def test_24gb_is_high(self):
+        from quantstar.config import classify_vram, VramTier
+        assert classify_vram(24) == VramTier.HIGH
+
+    def test_boundary_11gb_is_low(self):
+        from quantstar.config import classify_vram, VramTier
+        assert classify_vram(11) == VramTier.LOW
+
+    def test_boundary_12gb_is_medium(self):
+        from quantstar.config import classify_vram, VramTier
+        assert classify_vram(12) == VramTier.MEDIUM
+
+    def test_boundary_19gb_is_medium(self):
+        from quantstar.config import classify_vram, VramTier
+        assert classify_vram(19) == VramTier.MEDIUM
+
+    def test_boundary_20gb_is_high(self):
+        from quantstar.config import classify_vram, VramTier
+        assert classify_vram(20) == VramTier.HIGH
+
+    def test_vram8_picks_9b_repo(self):
+        """8 GB profile selects the pre-quantized 9B model."""
+        from quantstar.config import load_config
+        cfg = load_config("nonexistent.yaml", vram_gb=8)
+        assert "9B" in cfg.model.repo or "9b" in cfg.model.repo.lower()
+
+    def test_vram8_sets_128k_context(self):
+        from quantstar.config import load_config
+        cfg = load_config("nonexistent.yaml", vram_gb=8)
+        assert cfg.inference.max_context == 131072
+
+    def test_vram24_picks_27b_repo(self):
+        from quantstar.config import load_config
+        cfg = load_config("nonexistent.yaml", vram_gb=24)
+        assert "27B" in cfg.model.repo
+
+    def test_vram24_sets_256k_context(self):
+        from quantstar.config import load_config
+        cfg = load_config("nonexistent.yaml", vram_gb=24)
+        assert cfg.inference.max_context == 262144
+
+    def test_vram_tier_stored_on_config(self):
+        from quantstar.config import load_config, VramTier
+        cfg = load_config("nonexistent.yaml", vram_gb=8)
+        assert cfg.vram_tier == VramTier.LOW
+
+    def test_vram8_sets_max_image_pixels(self):
+        from quantstar.config import load_config
+        cfg = load_config("nonexistent.yaml", vram_gb=8)
+        assert cfg.inference.max_image_pixels is not None
+        assert cfg.inference.max_image_pixels <= 262144
+        # min_pixels must also be set — processor ignores max_pixels without min_pixels
+        assert cfg.inference.min_image_pixels is not None
+
+    def test_vram24_no_image_pixel_cap(self):
+        from quantstar.config import load_config
+        cfg = load_config("nonexistent.yaml", vram_gb=24)
+        assert cfg.inference.max_image_pixels is None
+        assert cfg.inference.min_image_pixels is None
+
