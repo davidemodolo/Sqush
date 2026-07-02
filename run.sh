@@ -98,6 +98,23 @@ else:
         print('PATCHED: added loss and logits doc entries to Qwen3_5CausalLMOutputWithPast')
 "
     fi
+
+    # ── Patch bitsandbytes _check_is_size FutureWarning ──────────
+    _bnb_ops="$_py_site/bitsandbytes/backends/cuda/ops.py"
+    if [ -f "$_bnb_ops" ] && grep -q '_check_is_size' "$_bnb_ops"; then
+        python3 -c "
+path = '$_bnb_ops'
+with open(path) as fh:
+    content = fh.read()
+if '_check_is_size' not in content:
+    print('SKIP: already patched')
+else:
+    content = content.replace('torch._check_is_size(blocksize)', 'torch._check(blocksize >= 0)')
+    with open(path, 'w') as fh:
+        fh.write(content)
+    print('PATCHED: replaced _check_is_size with _check in bitsandbytes ops.py')
+"
+    fi
 fi
 
 # ── Auto-select bitsandbytes binary ────────────────────────────
