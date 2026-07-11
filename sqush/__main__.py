@@ -209,11 +209,20 @@ def _bake_safetensors(raw_path: str, cooked_path: str, log) -> None:
 
 
 def _bake_model(model_path: str, config, log) -> str:
-    """Process raw model: quantize embeddings to 4-bit side-car, save cooked copy, delete raw.
+    """Produce a compact cooked checkpoint and delete the raw one. One-time.
 
-    One-time operation. GPU peak < 100 MB. Returns the path to the saved cooked model.
+    Two strategies depending on the source checkpoint:
+    - LOW tier: the source is already a bitsandbytes 4-bit repo, so a cheap
+      CPU-only side-car pass (quantize embeddings + patch config) suffices;
+      GPU peak < 100 MB.
+    - HIGH tier: the source is full bf16 (~54 GB), so the LM weights must be
+      genuinely NF4-quantized on the GPU and re-serialized (~15 GB cooked).
+
+    Returns the path to the saved cooked model.
     """
     import shutil
+
+    from .config import VramTier
 
     cooked_path = _cooked_model_path(model_path)
 
@@ -221,7 +230,15 @@ def _bake_model(model_path: str, config, log) -> str:
     log.info("  raw    → %s", model_path)
     log.info("  cooked → %s", cooked_path)
 
-    _bake_safetensors(model_path, cooked_path, log)
+    if config.vram_tier == VramTier.LOW:
+        _bake_safetensors(model_path, cooked_path, log)
+    else:
+        from .quantize import bake_nf4_checkpoint
+        bake_nf4_checkpoint(
+            model_path, cooked_path,
+            torch_dtype_str=config.model.torch_dtype,
+            attn_implementation=config.model.attn_implementation,
+        )
 
     log.info("Deleting raw model at %s", model_path)
     shutil.rmtree(model_path)
@@ -295,7 +312,7 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("download", help="Download the model from HuggingFace")
-    sub.add_parser("bake", help="Quantize visual encoder and save cooked model (8GB tier only)")
+    sub.add_parser("bake", help="Quantize and save a compact cooked model, deleting the raw one")
     sub.add_parser("serve", help="Start the OpenAI-compatible server")
     sub.add_parser("chat", help="Start interactive chat")
     sub.add_parser("info", help="Show configuration")
@@ -330,13 +347,20 @@ def main():
 
     elif args.command == "bake":
         from .download import download_model
-        raw_path = download_model(config.model.repo, config.model.cache_dir)
+        from pathlib import Path
+
+        # A successful bake deletes the raw model, so check the cooked path
+        # (derived from config, not from a download) first — otherwise a second
+        # bake would re-download tens of GB before discovering it's already done.
+        raw_path = str(
+            Path(config.model.cache_dir).resolve()
+            / config.model.repo.replace("/", "__")
+        )
         cooked = _cooked_model_path(raw_path)
         if os.path.exists(cooked):
             log.info("Cooked model already exists at %s — nothing to do.", cooked)
-        elif config.vram_tier != VramTier.LOW:
-            log.info("Bake is only needed for the 8 GB (LOW) tier — skipping.")
         else:
+            raw_path = download_model(config.model.repo, config.model.cache_dir)
             _bake_model(raw_path, config, log)
 
     elif args.command == "info":
@@ -359,19 +383,18 @@ def main():
 
         is_low = config.vram_tier == VramTier.LOW
 
-        if is_low:
-            raw_path = str(
-                Path(config.model.cache_dir).resolve()
-                / config.model.repo.replace("/", "__")
-            )
-            cooked = _cooked_model_path(raw_path)
-            if os.path.exists(cooked):
-                model_path = cooked
-            else:
-                model_path = download_model(config.model.repo, config.model.cache_dir)
-                model_path = _bake_model(model_path, config, log)
+        # Both tiers serve from a compact cooked checkpoint; bake it once if the
+        # cooked copy isn't present yet (deletes the bulky raw model afterwards).
+        raw_path = str(
+            Path(config.model.cache_dir).resolve()
+            / config.model.repo.replace("/", "__")
+        )
+        cooked = _cooked_model_path(raw_path)
+        if os.path.exists(cooked):
+            model_path = cooked
         else:
             model_path = download_model(config.model.repo, config.model.cache_dir)
+            model_path = _bake_model(model_path, config, log)
 
         from .quantize import load_and_quantize_model
         model, tokenizer, processor, cache_config = load_and_quantize_model(

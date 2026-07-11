@@ -172,7 +172,7 @@ case "$MODE" in
         python -m sqush --vram "$VRAM_GB" download
         ;;
     bake)
-        info "Baking model (quantize visual encoder, one-time) …"
+        info "Baking model (quantize + save compact cooked model, one-time) …"
         python -m sqush --vram "$VRAM_GB" bake
         ;;
     serve)
@@ -194,7 +194,7 @@ case "$MODE" in
         echo "Usage: ./run.sh [download|bake|serve|chat|info|init]"
         echo ""
         echo "  download  — download model from HuggingFace"
-        echo "  bake      — quantize visual encoder and save cooked model (8 GB tier only)"
+        echo "  bake      — quantize and save a compact cooked model, deleting the raw one"
         echo "  serve     — start OpenAI-compatible API server"
         echo "  chat      — start interactive CLI chat"
         echo "  info      — show configuration"

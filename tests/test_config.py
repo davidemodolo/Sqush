@@ -215,9 +215,9 @@ class TestVramTier:
         from sqush.config import classify_vram, VramTier
         assert classify_vram(8) == VramTier.LOW
 
-    def test_16gb_is_medium(self):
+    def test_16gb_is_low(self):
         from sqush.config import classify_vram, VramTier
-        assert classify_vram(16) == VramTier.MEDIUM
+        assert classify_vram(16) == VramTier.LOW
 
     def test_24gb_is_high(self):
         from sqush.config import classify_vram, VramTier
@@ -227,13 +227,13 @@ class TestVramTier:
         from sqush.config import classify_vram, VramTier
         assert classify_vram(11) == VramTier.LOW
 
-    def test_boundary_12gb_is_medium(self):
+    def test_boundary_12gb_is_low(self):
         from sqush.config import classify_vram, VramTier
-        assert classify_vram(12) == VramTier.MEDIUM
+        assert classify_vram(12) == VramTier.LOW
 
-    def test_boundary_19gb_is_medium(self):
+    def test_boundary_19gb_is_low(self):
         from sqush.config import classify_vram, VramTier
-        assert classify_vram(19) == VramTier.MEDIUM
+        assert classify_vram(19) == VramTier.LOW
 
     def test_boundary_20gb_is_high(self):
         from sqush.config import classify_vram, VramTier

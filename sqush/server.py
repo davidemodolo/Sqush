@@ -118,7 +118,14 @@ def create_app(engine: InferenceEngine, config: SqushConfig) -> FastAPI:
                 _stream_response(messages, max_tokens, enable_thinking, tools, engine, config, temperature, top_p)
             )
         else:
-            return _sync_response(messages, max_tokens, enable_thinking, tools, engine, config, temperature, top_p)
+            # Generation is blocking and can take minutes; run it off the event
+            # loop so other requests (and /health) stay responsive.
+            import asyncio
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, _sync_response, messages, max_tokens, enable_thinking,
+                tools, engine, config, temperature, top_p,
+            )
 
     return app
 
@@ -155,7 +162,6 @@ async def _stream_response(messages, max_tokens, enable_thinking, tools,
         messages, max_tokens, enable_thinking=enable_thinking, tools=tools,
         temperature=temperature, top_p=top_p,
     )
-    prompt_tokens = engine._last_prompt_tokens
 
     buffer = ""
     state = "think" if enable_thinking else "post"
@@ -172,14 +178,44 @@ async def _stream_response(messages, max_tokens, enable_thinking, tools,
     TOOL_CLOSE = "</tool_call>"
     HOLD = max(len(THINK_TAG), len(THINK_CLOSE), len(TOOL_TAG), len(TOOL_CLOSE)) - 1
 
-    log.info("_stream_response start enable_thinking=%s state=%s tools=%s max_tokens=%s prompt_tokens=%d",
-             enable_thinking, state, bool(tools), max_tokens, prompt_tokens)
+    stream_start = time.perf_counter()
+    last_tps_log_tokens = 0
+    last_tps_log_time = stream_start
+    think_start = stream_start if state == "think" else None
+    token_count = 0
+    prompt_tokens = 0
+    first_token = True
 
     while True:
         text = await loop.run_in_executor(None, _next_token, gen)
+        if first_token:
+            # _last_prompt_tokens is only populated once the generator body runs,
+            # which first happens on the pull above — reading it before the loop
+            # returns the previous request's value (or 0 on the first request).
+            prompt_tokens = engine._last_prompt_tokens
+            log.info("_stream_response start enable_thinking=%s state=%s tools=%s max_tokens=%s prompt_tokens=%d",
+                     enable_thinking, state, bool(tools), max_tokens, prompt_tokens)
+            first_token = False
         if text is None:
             break
         buffer += text
+
+        # Count incrementally on the new chunk — re-encoding the whole buffer per
+        # token is O(n²) and slows the very stream this meter measures.
+        token_count += len(engine.tokenizer.encode(text, add_special_tokens=False))
+        current_tokens = token_count
+        tokens_since = current_tokens - last_tps_log_tokens
+        tps_interval = getattr(config.logging, 'tps_interval_tokens', 50)
+        if tokens_since >= tps_interval:
+            now = time.perf_counter()
+            elapsed_total = now - stream_start
+            elapsed_recent = now - last_tps_log_time
+            total_tps = current_tokens / elapsed_total if elapsed_total > 0 else 0
+            recent_tps = tokens_since / elapsed_recent if elapsed_recent > 0 else 0
+            log.info("stream TPS: %.1f total, %.1f recent (%d tok/%.2fs, state=%s)",
+                     total_tps, recent_tps, tokens_since, elapsed_recent, state)
+            last_tps_log_tokens = current_tokens
+            last_tps_log_time = now
 
         if state == "think":
             end_idx = buffer.find(THINK_CLOSE, think_emitted)
@@ -195,6 +231,12 @@ async def _stream_response(messages, max_tokens, enable_thinking, tools,
                     yield _delta_chunk(request_id, created, model, reasoning_content=text)
                 think_emitted = len(buffer)
                 content_emitted = end_idx + len(THINK_CLOSE)
+                if think_start is not None:
+                    think_tokens = len(engine.tokenizer.encode(buffer[:end_idx], add_special_tokens=False))
+                    think_elapsed = time.perf_counter() - think_start
+                    think_tps = think_tokens / think_elapsed if think_elapsed > 0 else 0
+                    log.info("stream TPS think-phase: %d tokens in %.2fs (%.1f tok/s)",
+                             think_tokens, think_elapsed, think_tps)
                 state = "post"
                 continue
 
@@ -250,11 +292,20 @@ async def _stream_response(messages, max_tokens, enable_thinking, tools,
         remaining = buffer[think_emitted:]
         if remaining:
             yield _delta_chunk(request_id, created, model, reasoning_content=remaining)
+    if state == "tool_call" and tool_parser is not None:
+        # Stream ended before </tool_call>; finalize so the arguments delta is
+        # still emitted instead of a tool call with an empty argument list.
+        deltas = tool_parser(buffer[tool_calls_emitted:], finalize=True)
+        for tc in deltas:
+            yield _delta_chunk(request_id, created, model, tool_calls=tc)
 
     completion_tokens = len(engine.tokenizer.encode(buffer, add_special_tokens=False))
+    total_elapsed = time.perf_counter() - stream_start
+    avg_tps = completion_tokens / total_elapsed if total_elapsed > 0 else 0
 
-    log.info("_stream_response done prompt_tokens=%d completion_tokens=%d total_tokens=%d buffer_chars=%d",
-             prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, len(buffer))
+    log.info("_stream_response done prompt_tokens=%d completion_tokens=%d total_tokens=%d in %.2fs (%.1f tok/s)",
+             prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
+             total_elapsed, avg_tps)
 
     finish_reason = "tool_calls" if has_tool_calls else "stop"
 
@@ -379,11 +430,16 @@ def _sync_response(messages, max_tokens, enable_thinking, tools,
     reasoning_content = None
     tool_calls = None
 
-    think_start = raw_text.find("<think>")
-    if think_start != -1:
-        think_end = raw_text.find("</think>", think_start)
+    # Mirror the streaming path: with add_generation_prompt the model emits the
+    # closing </think> only (the opening tag lives in the prompt), so everything
+    # up to </think> is reasoning even when no <think> tag is present.
+    if enable_thinking:
+        think_end = raw_text.find("</think>")
         if think_end != -1:
-            reasoning_content = raw_text[think_start + len("<think>"):think_end].strip()
+            reasoning = raw_text[:think_end]
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>"):]
+            reasoning_content = reasoning.strip()
             content = raw_text[think_end + len("</think>"):].strip()
 
     first_tool = content.find("<tool_call>") if content else -1

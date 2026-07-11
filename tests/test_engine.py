@@ -300,6 +300,9 @@ class TestChatCompletionStreamPathSelection:
             def __iter__(self):
                 return iter(["hello", " world"])
 
+            def end(self):
+                pass
+
         # Simulate a real thread that actually runs target
         class RealThread:
             def __init__(self, target, kwargs=None, **kw):
@@ -338,6 +341,9 @@ class TestChatCompletionStreamPathSelection:
 
             def __iter__(self):
                 return iter(["hi"])
+
+            def end(self):
+                pass
 
         class RealThread:
             def __init__(self, target=None, kwargs=None, **kw):
@@ -792,6 +798,7 @@ class TestSessionReuse:
         class FakeStreamer:
             def __init__(self, *a, **kw): pass
             def __iter__(self): return iter(["hello"])
+            def end(self): pass
 
         class FakeGenOutput:
             sequences = torch.zeros(1, 5, dtype=torch.long)
