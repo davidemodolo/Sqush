@@ -173,7 +173,17 @@ case "$MODE" in
         ;;
     bake)
         info "Baking model (quantize + save compact cooked model, one-time) …"
-        python -m sqush --vram "$VRAM_GB" bake
+        # Baking briefly loads the full model and writes a large checkpoint, which
+        # saturates CPU/IO and the page cache. Run it at low CPU + idle IO priority
+        # and cap threads so the desktop (VS Code, etc.) stays responsive.
+        _prio=""
+        command -v nice   &>/dev/null && _prio="nice -n 19"
+        command -v ionice &>/dev/null && _prio="$_prio ionice -c3"
+        _threads="$(( $(nproc 2>/dev/null || echo 4) / 2 ))"
+        [ "$_threads" -lt 1 ] && _threads=1
+        info "  (low priority, OMP_NUM_THREADS=${_threads})"
+        env OMP_NUM_THREADS="$_threads" MKL_NUM_THREADS="$_threads" \
+            $_prio python -m sqush --vram "$VRAM_GB" bake
         ;;
     serve)
         info "Starting server …"

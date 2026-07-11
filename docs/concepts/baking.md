@@ -42,6 +42,16 @@ During a bake the raw and cooked models coexist:
 
 The raw is only deleted **after** the bake succeeds — if `bake_nf4_checkpoint` raises, the raw is left intact.
 
+## Keeping the desktop responsive during a HIGH bake
+
+The HIGH bake briefly loads the full bf16 model and writes a large checkpoint. On a machine where the model is bigger than RAM (e.g. a 52 GB model on 30 GB RAM), this thrashes the page cache and can hit the kernel's dirty‑page writeback limit (`vm.dirty_ratio`), which freezes interactive apps like VS Code for the duration.
+
+Mitigations (all one‑time, since serving later loads only the ~18 GB cooked model):
+
+- `./run.sh bake` runs the bake at **low CPU priority** (`nice -n 19`), **idle IO priority** (`ionice -c3`), and with **half the cores** (`OMP_NUM_THREADS`), so the UI keeps its slices. `bake_nf4_checkpoint` also caps `torch.set_num_threads` when invoked directly.
+- Prefer running `./run.sh bake` in a **standalone terminal** before `serve`, rather than letting the first `serve` bake inline.
+- If writeback stalls still bite, temporarily lower the dirty‑page threshold (needs root): `sudo sysctl -w vm.dirty_bytes=268435456` (256 MB) during the bake, then reset.
+
 ## Detection on reload
 
 `_model_is_pre_quantized` checks `config.json` for `quantization_config.quant_method == "bitsandbytes"`. A cooked HIGH checkpoint matches, so `load_and_quantize_model` takes the fast **already‑quantized** branch (logging `Loaded pre-quantized bitsandbytes model from disk`) instead of re‑quantizing bf16.

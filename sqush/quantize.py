@@ -825,9 +825,17 @@ def bake_nf4_checkpoint(
     a pure-GPU device_map (no CPU offload), which the 24 GB tier provides.
     """
     import gc as _gc
+    import os as _os
 
     from transformers import AutoModelForImageTextToText, AutoTokenizer, BitsAndBytesConfig
     from transformers.models.qwen3_vl import Qwen3VLProcessor
+
+    # Leave CPU headroom during the one-time bake so the desktop stays responsive
+    # (loading + quantizing otherwise saturates every core).
+    try:
+        torch.set_num_threads(max(1, (_os.cpu_count() or 2) // 2))
+    except Exception:
+        pass
 
     dtype = getattr(torch, torch_dtype_str) if torch_dtype_str != "auto" else torch.bfloat16
 
