@@ -13,7 +13,6 @@ log = logging.getLogger(__name__)
 
 class VramTier(IntEnum):
     LOW = 8
-    MEDIUM = 16
     HIGH = 24
 
 
@@ -22,11 +21,6 @@ VRAM_PROFILES: dict[VramTier, dict] = {
         "model": {"repo": "techwithsergiu/Qwen3.5-9B-bnb-4bit"},
         "quantization": {"weight_bits": 4, "kv_cache_bits": 4},
         "inference": {"max_context": 262144, "max_image_pixels": 131072, "min_image_pixels": 16384},
-    },
-    VramTier.MEDIUM: {
-        "model": {"repo": None},
-        "quantization": {"weight_bits": 4, "kv_cache_bits": 4},
-        "inference": {"max_context": None},
     },
     VramTier.HIGH: {
         "model": {"repo": "Qwen/Qwen3.6-27B"},
@@ -71,6 +65,7 @@ class ServerConfig:
 @dataclass
 class LoggingConfig:
     level: str = "INFO"
+    tps_interval_tokens: int = 50
 
 
 @dataclass
@@ -97,8 +92,6 @@ def detect_vram() -> int:
 def classify_vram(raw_gb: int) -> VramTier:
     if raw_gb >= 20:
         return VramTier.HIGH
-    if raw_gb >= 12:
-        return VramTier.MEDIUM
     return VramTier.LOW
 
 

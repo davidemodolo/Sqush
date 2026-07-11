@@ -1,0 +1,97 @@
+site_name: Sqush
+site_description: Squshed Qwen Under Small Hardware — 4-bit quantized Qwen inference on a single consumer GPU.
+site_url: https://davidemodolo.github.io/Sqush/
+repo_url: https://github.com/davidemodolo/Sqush
+repo_name: davidemodolo/Sqush
+edit_uri: edit/main/docs/
+copyright: Sqush — a recursive acronym, like Wine.
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra_javascript:
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - getting-started/installation.md
+      - getting-started/quickstart.md
+      - getting-started/configuration.md
+  - Concepts:
+      - concepts/vram-tiers.md
+      - concepts/baking.md
+      - concepts/session-kv-reuse.md
+  - Internals:
+      - internals/architecture.md
+      - internals/quantization.md
+      - internals/kv-cache.md
+      - internals/attention.md
+      - internals/inference-engine.md
+      - internals/server.md
+      - internals/cli.md
+  - Reference:
+      - reference/api.md
+      - reference/commands.md
+      - reference/benchmarks.md
+  - Development:
+      - development/testing.md
+      - development/contributing.md

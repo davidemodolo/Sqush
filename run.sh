@@ -172,8 +172,18 @@ case "$MODE" in
         python -m sqush --vram "$VRAM_GB" download
         ;;
     bake)
-        info "Baking model (quantize visual encoder, one-time) …"
-        python -m sqush --vram "$VRAM_GB" bake
+        info "Baking model (quantize + save compact cooked model, one-time) …"
+        # Baking briefly loads the full model and writes a large checkpoint, which
+        # saturates CPU/IO and the page cache. Run it at low CPU + idle IO priority
+        # and cap threads so the desktop (VS Code, etc.) stays responsive.
+        _prio=""
+        command -v nice   &>/dev/null && _prio="nice -n 19"
+        command -v ionice &>/dev/null && _prio="$_prio ionice -c3"
+        _threads="$(( $(nproc 2>/dev/null || echo 4) / 2 ))"
+        [ "$_threads" -lt 1 ] && _threads=1
+        info "  (low priority, OMP_NUM_THREADS=${_threads})"
+        env OMP_NUM_THREADS="$_threads" MKL_NUM_THREADS="$_threads" \
+            $_prio python -m sqush --vram "$VRAM_GB" bake
         ;;
     serve)
         info "Starting server …"
@@ -194,7 +204,7 @@ case "$MODE" in
         echo "Usage: ./run.sh [download|bake|serve|chat|info|init]"
         echo ""
         echo "  download  — download model from HuggingFace"
-        echo "  bake      — quantize visual encoder and save cooked model (8 GB tier only)"
+        echo "  bake      — quantize and save a compact cooked model, deleting the raw one"
         echo "  serve     — start OpenAI-compatible API server"
         echo "  chat      — start interactive CLI chat"
         echo "  info      — show configuration"

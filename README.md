@@ -27,10 +27,12 @@ Multimodal text + image input. Drop-in OpenAI-compatible API. Local, private, ze
 
 Sqush auto-detects your GPU and picks the right model and settings:
 
-| VRAM | Model | Download | Context | Weight Bits | KV Bits |
-|------|-------|----------|---------|-------------|---------|
-| 8 GB | Qwen3.5-9B (pre-quantized) | 8.6 GB | 256k | 4-bit NF4 | 4-bit int4 |
-| 24 GB | Qwen3.6-27B | 52 GB | 256k | 4-bit NF4 | 4-bit int4 |
+| VRAM | Model | Download | Disk after bake | Context | Weight Bits | KV Bits |
+|------|-------|----------|-----------------|---------|-------------|---------|
+| 8 GB | Qwen3.5-9B (pre-quantized) | 8.6 GB | ~6.7 GB | 256k | 4-bit NF4 | 4-bit int4 |
+| 24 GB | Qwen3.6-27B | 52 GB | ~18 GB | 256k | 4-bit NF4 | 4-bit int4 |
+
+Both tiers *bake* the model on first run: they quantize it to a compact NF4 checkpoint on disk and delete the bulky raw download. Baking needs ~70 GB free transiently (raw + cooked) but leaves only the cooked model afterwards. Subsequent starts load the cooked checkpoint directly — smaller on disk and faster to start (no re-quantization).
 
 Override auto-detection with `--vram`:
 
@@ -43,13 +45,19 @@ The 8 GB tier uses [`techwithsergiu/Qwen3.5-9B-bnb-4bit`](https://huggingface.co
 
 Image inputs on the 8 GB tier are capped at 131,072 pixels (≈ 362 × 362) before being passed to the vision encoder. Images larger than this are downscaled to fit. This is necessary because the vision encoder's self-attention over image patches generates large bfloat16 activation tensors — at full 1024 × 1024 resolution (4096 patches) this exceeds the VRAM budget regardless of weight quantization. At the cap, the vision encoder sees 512 patches instead of 4096, keeping activation memory within budget.
 
-The 24 GB tier downloads the full Qwen3.6-27B model and quantizes it at load time using bitsandbytes NF4.
+The 24 GB tier downloads the full Qwen3.6-27B model (~52 GB in bfloat16) and bakes it on first run: it loads the model with bitsandbytes NF4, serializes the packed 4-bit weights to a compact cooked checkpoint (~18 GB), and deletes the 52 GB raw download. This is a one-time GPU operation (~1 min on an RTX 3090); every subsequent start loads the cooked NF4 checkpoint directly instead of re-quantizing bfloat16 weights from scratch. The bake needs the raw and cooked models on disk simultaneously (~70 GB transient), then settles at ~18 GB.
 
 ## Quickstart
 
 ```bash
 ./run.sh download    # download Qwen3.6-27B (one-time, ~52 GB)
-./run.sh serve       # start the API on 127.0.0.1:9898
+./run.sh serve       # bakes to ~18 GB on first run, then starts the API on 127.0.0.1:9898
+```
+
+The first `serve` (or `chat`) bakes the model and deletes the raw download — ensure ~70 GB free for that one-time step. You can also bake explicitly first:
+
+```bash
+./run.sh bake        # quantize + save compact cooked model, delete the raw one
 ```
 
 That's it. Test with:
@@ -78,7 +86,7 @@ Register Sqush as a local provider:
 ./run.sh init
 ```
 
-This writes the provider and agent config to `~/.config/opencode/opencode.json`. Then in OpenCode, run `/models` and select `sqush/qwen3.6-27b`.
+This writes the provider config to `~/.config/opencode/opencode.json`. Then in OpenCode, run `/models` and select `sqush/qwen3.6-27b`.
 
 Or add it manually - in your `opencode.json`:
 
@@ -104,13 +112,6 @@ Or add it manually - in your `opencode.json`:
           "limit": { "context": 262144, "output": 65536 }
         }
       }
-    }
-  },
-  "agent": {
-    "sqush": {
-      "description": "Local Sqush - Qwen3.6 27B 4-bit",
-      "model": "sqush/qwen3.6-27b",
-      "temperature": 0
     }
   }
 }
@@ -227,7 +228,8 @@ The suite covers:
 - **FastAPI server** — health/VRAM endpoints, models list, sync and streaming completions, SSE format, CORS, thinking/reasoning content, tool call parsing and streaming
 - **Config loading** — YAML overrides, env var precedence, defaults
 - **CLI** — history trimming, `<think>` block stripping from display output
-- **`__main__`** — OpenCode config init and path resolution
+- **`__main__`** — OpenCode config init and path resolution, tier-aware bake dispatch (LOW side-car vs HIGH NF4)
+- **Download** — checkpoint completeness detection (resume partial downloads, reject corrupt/partial snapshots)
 
 For end-to-end smoke testing against a live server (requires a GPU and the downloaded model):
 

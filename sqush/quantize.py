@@ -807,6 +807,66 @@ def load_and_quantize_model(
     return model, tokenizer, processor, cache_factory
 
 
+def bake_nf4_checkpoint(
+    raw_path: str,
+    cooked_path: str,
+    torch_dtype_str: str = "bfloat16",
+    attn_implementation: str = "sdpa",
+) -> None:
+    """One-time NF4 quantization of a full-precision checkpoint, saved to disk.
+
+    Loads the model with bitsandbytes 4-bit (needs a GPU that fits the 4-bit
+    model — the same one that serves it) and serializes the packed NF4 weights
+    plus quantization_config via save_pretrained, so subsequent loads take the
+    fast pre-quantized path instead of re-quantizing ~54 GB of bf16 every launch.
+
+    Unlike the 8 GB tier's side-car bake, this genuinely quantizes the LM weights
+    (bnb requires CUDA for that), so it cannot run on CPU. Serialization requires
+    a pure-GPU device_map (no CPU offload), which the 24 GB tier provides.
+    """
+    import gc as _gc
+    import os as _os
+
+    from transformers import AutoModelForImageTextToText, AutoTokenizer, BitsAndBytesConfig
+    from transformers.models.qwen3_vl import Qwen3VLProcessor
+
+    # Leave CPU headroom during the one-time bake so the desktop stays responsive
+    # (loading + quantizing otherwise saturates every core).
+    try:
+        torch.set_num_threads(max(1, (_os.cpu_count() or 2) // 2))
+    except Exception:
+        pass
+
+    dtype = getattr(torch, torch_dtype_str) if torch_dtype_str != "auto" else torch.bfloat16
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=dtype,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    log.info("Bake: loading %s with bitsandbytes NF4 (one-time) …", raw_path)
+    model = AutoModelForImageTextToText.from_pretrained(
+        raw_path,
+        quantization_config=bnb_config,
+        device_map="cuda:0",
+        attn_implementation=attn_implementation,
+        trust_remote_code=True,
+    )
+    _print_memory_usage("bake: after 4-bit load")
+
+    log.info("Bake: saving NF4 checkpoint → %s", cooked_path)
+    model.save_pretrained(cooked_path, safe_serialization=True)
+    AutoTokenizer.from_pretrained(raw_path, trust_remote_code=True).save_pretrained(cooked_path)
+    Qwen3VLProcessor.from_pretrained(raw_path).save_pretrained(cooked_path)
+
+    del model
+    _gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    log.info("Bake: NF4 checkpoint written.")
+
+
 # ---------------------------------------------------------------------------
 # Embedding quantization — saves ~1.5 GB on the 248k×4096 vocab table
 # ---------------------------------------------------------------------------
@@ -850,7 +910,10 @@ class QuantizedEmbedding(torch.nn.Module):
 
         w = ((vals.to(torch.bfloat16) - zp.unsqueeze(-1).to(torch.bfloat16))
              * sc.unsqueeze(-1).to(torch.bfloat16))
-        w = w[:, :, : self.embedding_dim]
+        # Flatten the groups back to the padded row, then drop the padding — the
+        # padding lives at the end of the flattened row, not along the group axis,
+        # so slicing the group axis (size 128) against embedding_dim was a no-op.
+        w = w.reshape(n, padded)[:, : self.embedding_dim]
         return w.reshape(*indices.shape, self.embedding_dim)
 
 
