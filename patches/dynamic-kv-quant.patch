@@ -1,0 +1,1159 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 4469612..8dcab14 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2456,6 +2456,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cache_type_v = kv_cache_type_from_str(value);
+         }
+     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
++    add_opt(common_arg(
++        {"--kv-stages"}, "TYPES",
++        string_format(
++            "dynamic KV cache quantization stages, comma-separated (e.g. f16,q8_0,q4_0)\n"
++            "the cache starts at the first type and is converted to each following type as it fills up\n"
++            "the KV memory is sized to hold the last type at the full context\n"
++            "allowed values: %s\n"
++            "(default: disabled)",
++            get_all_kv_cache_types().c_str()
++        ),
++        [](common_params & params, const std::string & value) {
++            params.kv_stages.clear();
++
++            for (const auto & type : string_split(value, ",")) {
++                params.kv_stages.push_back(kv_cache_type_from_str(type));
++            }
++
++            if (params.kv_stages.size() < 2) {
++                throw std::invalid_argument("--kv-stages requires at least 2 types");
++            }
++        }
++    ).set_env("LLAMA_ARG_KV_STAGES"));
++    add_opt(common_arg(
++        {"--kv-requant-margin"}, "N",
++        string_format(
++            "start the next KV quantization stage when N free KV cells remain\n"
++            "(default: %u)",
++            params.kv_requant_margin
++        ),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("--kv-requant-margin must be >= 0");
++            }
++            params.kv_requant_margin = value;
++        }
++    ).set_env("LLAMA_ARG_KV_REQUANT_MARGIN"));
+     add_opt(common_arg(
+         {"--hellaswag"},
+         "compute HellaSwag score over random tasks from datafile supplied with -f",
+diff --git a/common/common.cpp b/common/common.cpp
+index d162a38..56f507d 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1752,6 +1752,20 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.type_k = params.cache_type_k;
+     cparams.type_v = params.cache_type_v;
+ 
++    if (!params.kv_stages.empty()) {
++        cparams.type_k = params.kv_stages[0];
++        cparams.type_v = params.kv_stages[0];
++
++        cparams.kv_stages_n = std::min<uint32_t>((uint32_t) params.kv_stages.size(), LLAMA_KV_STAGES_MAX);
++        for (uint32_t i = 0; i < cparams.kv_stages_n; ++i) {
++            cparams.kv_stages[i] = params.kv_stages[i];
++        }
++    } else {
++        cparams.kv_stages_n = 0;
++    }
++
++    cparams.kv_requant_margin = params.kv_requant_margin;
++
+     return cparams;
+ }
+ 
+diff --git a/common/common.h b/common/common.h
+index 4e9448b..9f0f7c6 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -587,6 +587,11 @@ struct common_params {
+     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
+     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+ 
++    // dynamic KV cache quantization stages, applied in order as the cache fills
++    // the first stage is the initial type and the last one is the final type
++    std::vector<ggml_type> kv_stages;
++    uint32_t kv_requant_margin = 4096; // convert when the number of free KV cells drops below this
++
+     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
+ 
+     // multimodal models (see tools/mtmd)
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index d34d1c9..acb94da 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2520,6 +2520,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
+ 
+     result.cache_type_k  = params_spec.cache_type_k;
+     result.cache_type_v  = params_spec.cache_type_v;
++
++    // dynamic KV quantization applies to the main context only
++    result.kv_stages.clear();
++
+     result.n_outputs_max = params.n_parallel;
+     result.n_outputs_max_per_seq = 1;
+ 
+diff --git a/include/llama.h b/include/llama.h
+index ef7a012..8be064c 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -45,6 +45,9 @@
+ #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
+ #define LLAMA_SESSION_VERSION 10
+ 
++// maximum number of dynamic KV cache quantization stages
++#define LLAMA_KV_STAGES_MAX 8
++
+ #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
+ #define LLAMA_STATE_SEQ_VERSION 3
+ 
+@@ -389,6 +392,14 @@ extern "C" {
+         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
+         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+ 
++        // dynamic KV cache quantization: kv_stages[0] (must match type_k/type_v) is converted to each
++        // following type as the cache fills, with memory sized for the last one; kv_stages_n <= 1 disables it
++        uint32_t       kv_stages_n;
++        enum ggml_type kv_stages[LLAMA_KV_STAGES_MAX];
++
++        // start the next KV stage when the number of free cells drops below this value
++        uint32_t kv_requant_margin;
++
+         // Abort callback
+         // if it returns true, execution of llama_decode() will be aborted
+         // currently works only with CPU execution
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9aed801..272e2e6 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -272,6 +272,12 @@ llama_context::llama_context(
+     cparams.op_offload = params.op_offload;
+     cparams.kv_unified = params.kv_unified;
+ 
++    cparams.kv_stages_n = std::min<uint32_t>(params.kv_stages_n, LLAMA_KV_STAGES_MAX);
++    for (uint32_t i = 0; i < cparams.kv_stages_n; ++i) {
++        cparams.kv_stages[i] = params.kv_stages[i];
++    }
++    cparams.kv_requant_margin = params.kv_requant_margin;
++
+     // initialized later
+     cparams.pipeline_parallel = false;
+ 
+@@ -387,11 +393,17 @@ llama_context::llama_context(
+         llama_memory_params params_mem = {
+             /*.type_k    =*/ params.type_k,
+             /*.type_v    =*/ params.type_v,
++            /*.stages    =*/ {},
+             /*.swa_full  =*/ params.swa_full,
+             /*.ctx_type  =*/ cparams.ctx_type,
+             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+         };
+ 
++        params_mem.stages.margin = cparams.kv_requant_margin;
++        for (uint32_t i = 0; i < cparams.kv_stages_n; ++i) {
++            params_mem.stages.types.push_back(cparams.kv_stages[i]);
++        }
++
+         memory.reset(model.create_memory(params_mem, cparams));
+     }
+ 
+@@ -1786,6 +1798,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         break;
+     }
+ 
++    if (memory && memory->check_and_clear_requantized()) {
++        LLAMA_LOG_INFO("%s: KV cache was requantized, re-reserving compute buffers\n", __func__);
++
++        sched_need_reserve = true;
++        sched_reserve();
++    }
++
+     // reserve output buffer
+     if (output_reserve(n_outputs_all) < n_outputs_all) {
+         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+@@ -3617,6 +3636,9 @@ llama_context_params llama_context_default_params() {
+         /*.cb_eval_user_data           =*/ nullptr,
+         /*.type_k                      =*/ GGML_TYPE_F16,
+         /*.type_v                      =*/ GGML_TYPE_F16,
++        /*.kv_stages_n                 =*/ 0,
++        /*.kv_stages                   =*/ {},
++        /*.kv_requant_margin           =*/ 0,
+         /*.abort_callback              =*/ nullptr,
+         /*.abort_callback_data         =*/ nullptr,
+         /*.embeddings                  =*/ false,
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 574ce95..58f7784 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -54,6 +54,11 @@ struct llama_cparams {
+     bool kv_unified;
+     bool pipeline_parallel;
+ 
++    // dynamic KV cache quantization
++    uint32_t       kv_stages_n;
++    enum ggml_type kv_stages[LLAMA_KV_STAGES_MAX];
++    uint32_t       kv_requant_margin;
++
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+     enum llama_context_type ctx_type;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 8fafcd1..cc755c1 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -13,6 +13,7 @@
+ #include <limits>
+ #include <map>
+ #include <stdexcept>
++#include <thread>
+ #include <unordered_map>
+ 
+ static bool ggml_is_power_of_2(int n) {
+@@ -63,6 +64,71 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
+ // llama_kv_cache
+ //
+ 
++// the K/V row widths of a cache layer and the buffer type it is placed in
++struct kv_layer_dims {
++    ggml_backend_buffer_type_t buft;
++    uint32_t n_embd_k;
++    uint32_t n_embd_v;
++    bool     has_v;
++};
++
++struct kv_buft_less {
++    bool operator()(ggml_backend_buffer_type_t lhs, ggml_backend_buffer_type_t rhs) const {
++        return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
++    }
++};
++
++// drop the first stage that does not shrink the rows of every layer, and the stages after it
++static void kv_stages_drop_useless(std::vector<ggml_type> & types, const std::vector<kv_layer_dims> & dims) {
++    for (size_t s = 1; s < types.size(); ++s) {
++        for (const auto & d : dims) {
++            const bool smaller_k = ggml_row_size(types[s], d.n_embd_k) < ggml_row_size(types[s - 1], d.n_embd_k);
++            const bool smaller_v = !d.has_v || ggml_row_size(types[s], d.n_embd_v) < ggml_row_size(types[s - 1], d.n_embd_v);
++
++            if (!smaller_k || !smaller_v) {
++                LLAMA_LOG_WARN("%s: stage %s does not reduce the cache size - dropping it and the following stages\n",
++                        __func__, ggml_type_name(types[s]));
++                types.resize(s);
++                return;
++            }
++        }
++    }
++}
++
++// cells per stage when each buffer type holds the last stage at kv_size cells
++static std::vector<uint32_t> kv_stage_capacities(
++        const std::vector<ggml_type> & types, const std::vector<kv_layer_dims> & dims,
++        uint32_t n_stream, uint32_t kv_size, uint32_t n_pad) {
++    std::map<ggml_backend_buffer_type_t, std::vector<size_t>, kv_buft_less> bytes_per_cell;
++
++    for (const auto & d : dims) {
++        auto & bpc = bytes_per_cell[d.buft];
++        bpc.resize(types.size(), 0);
++
++        for (size_t s = 0; s < types.size(); ++s) {
++            bpc[s] += (ggml_row_size(types[s], d.n_embd_k) + (d.has_v ? ggml_row_size(types[s], d.n_embd_v) : 0))*n_stream;
++        }
++    }
++
++    std::vector<uint32_t> capacity(types.size(), kv_size);
++
++    for (const auto & [buft, bpc] : bytes_per_cell) {
++        const size_t budget = bpc.back()*kv_size;
++
++        for (size_t s = 0; s < bpc.size(); ++s) {
++            if (bpc[s] > 0) {
++                capacity[s] = std::min(capacity[s], (uint32_t) std::min<size_t>(kv_size, budget / bpc[s]));
++            }
++        }
++    }
++
++    for (auto & cap : capacity) {
++        cap -= cap % n_pad;
++    }
++
++    return capacity;
++}
++
+ llama_kv_cache::llama_kv_cache(
+         const llama_model & model,
+         const llama_hparams & hparams,
+@@ -80,7 +146,8 @@ llama_kv_cache::llama_kv_cache(
+     const layer_filter_cb & filter,
+     const  layer_reuse_cb & reuse,
+     const  layer_share_cb & share,
+-             const char *   name_tag) :
++             const char *   name_tag,
++    const llama_kv_stages & stages) :
+     model(model), hparams(hparams), v_trans(v_trans),
+     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+     other(static_cast<llama_kv_cache *>(mem_other)),
+@@ -98,10 +165,62 @@ llama_kv_cache::llama_kv_cache(
+         }
+     }
+ 
++    kv_stages = stages;
++
++    // dynamic quantization of the K/V cache is only possible when the cache owns its tensors,
++    // is not transposed (which requires flash attention) and uses a regular allocation
++    if (kv_stages.enabled()) {
++        if (other) {
++            LLAMA_LOG_WARN("%s: dynamic KV quantization is not supported for shared caches - disabling\n", __func__);
++            kv_stages.types.clear();
++        } else if (v_trans) {
++            LLAMA_LOG_WARN("%s: dynamic KV quantization requires flash attention - disabling\n", __func__);
++            kv_stages.types.clear();
++        } else if (n_stream > 1) {
++            // the streams are converted in place, which only keeps the layout of a single stream
++            LLAMA_LOG_WARN("%s: dynamic KV quantization requires a unified KV cache (--kv-unified) - disabling\n", __func__);
++            kv_stages.types.clear();
++        } else if (hparams.no_alloc) {
++            LLAMA_LOG_WARN("%s: dynamic KV quantization is not supported for this model - disabling\n", __func__);
++            kv_stages.types.clear();
++        } else if (kv_stages.types[0] != type_k || kv_stages.types[0] != type_v) {
++            LLAMA_LOG_WARN("%s: first KV stage (%s) does not match the cache types (%s/%s) - using the stage type\n", __func__,
++                    ggml_type_name(kv_stages.types[0]), ggml_type_name(type_k), ggml_type_name(type_v));
++
++            type_k = kv_stages.types[0];
++            type_v = kv_stages.types[0];
++        }
++    }
++
+     GGML_ASSERT(kv_size % n_pad == 0);
+ 
+     const uint32_t n_layer = hparams.n_layer_all;
+ 
++    const bool is_mla = hparams.is_mla();
++
++    // per K/V layer, in the order of `layers`: dims and buffer type
++    std::vector<kv_layer_dims> layer_dims;
++    std::vector<ggml_backend_buffer_type_t> layer_bufts;
++
++    if (kv_stages.enabled()) {
++        for (uint32_t il = 0; il < n_layer; il++) {
++            if (!hparams.has_kv(il) || (filter && !filter(il))) {
++                continue;
++            }
++
++            layer_dims.push_back({
++                offload ? ggml_backend_dev_buffer_type(model.dev_layer(il)) : ggml_backend_cpu_buffer_type(),
++                hparams.n_embd_k_gqa(il),
++                !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max(),
++                !is_mla,
++            });
++        }
++
++        kv_stages_drop_useless(kv_stages.types, layer_dims);
++    }
++
++    const uint32_t n_stage = kv_stages.enabled() ? (uint32_t) kv_stages.types.size() : 1;
++
+     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+     struct ggml_backend_buft_comparator {
+         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+@@ -115,7 +234,7 @@ llama_kv_cache::llama_kv_cache(
+         auto it = ctx_map.find(buft);
+         if (it == ctx_map.end()) {
+             ggml_init_params params = {
+-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
++                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*n_stage*ggml_tensor_overhead()),
+                 /*.mem_buffer =*/ NULL,
+                 /*.no_alloc   =*/ true,
+             };
+@@ -133,6 +252,13 @@ llama_kv_cache::llama_kv_cache(
+         return it->second.get();
+     };
+ 
++    // the K/V buffers hold the last stage at the full context; earlier stages get fewer cells
++    if (kv_stages.enabled()) {
++        kv_stage_capacity = kv_stage_capacities(kv_stages.types, layer_dims, n_stream, kv_size, n_pad);
++    }
++
++    const uint32_t kv_size_cur = kv_stage_capacity.empty() ? kv_size : kv_stage_capacity[0];
++
+     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
+ 
+     v_heads.resize(n_stream);
+@@ -142,7 +268,7 @@ llama_kv_cache::llama_kv_cache(
+ 
+     v_cells.resize(n_stream);
+     for (uint32_t s = 0; s < n_stream; ++s) {
+-        v_cells[s].resize(kv_size);
++        v_cells[s].resize(kv_size_cur);
+     }
+ 
+     // by default, all sequence ids are mapped to the 0th stream
+@@ -161,8 +287,6 @@ llama_kv_cache::llama_kv_cache(
+                 __func__, hparams.n_embd_v_gqa_max());
+     }
+ 
+-    const bool is_mla = hparams.is_mla();
+-
+     for (uint32_t il = 0; il < n_layer; il++) {
+         if (!hparams.has_kv(il)) {
+             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
+@@ -231,23 +355,46 @@ llama_kv_cache::llama_kv_cache(
+         const bool has_k = true;
+         const bool has_v = !is_mla;
+ 
+-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
++        std::vector<kv_layer> layer_stages;
++        layer_stages.reserve(n_stage);
+ 
+-        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+-        has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
++        for (uint32_t is = 0; is < n_stage; ++is) {
++            const ggml_type type_ks = kv_stages.enabled() ? kv_stages.types[is] : type_k;
++            const ggml_type type_vs = kv_stages.enabled() ? kv_stages.types[is] : type_v;
++            const uint32_t kv_size_s = kv_stage_capacity.empty() ? kv_size : kv_stage_capacity[is];
+ 
+-        std::vector<ggml_tensor *> k_stream;
+-        std::vector<ggml_tensor *> v_stream;
++            ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_ks, n_embd_k_gqa, kv_size_s, n_stream) : nullptr;
++            ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_vs, n_embd_v_gqa, kv_size_s, n_stream) : nullptr;
+ 
+-        for (uint32_t s = 0; s < n_stream; ++s) {
+-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
++            has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
++            has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
++
++            std::vector<ggml_tensor *> k_stream;
++            std::vector<ggml_tensor *> v_stream;
++
++            for (uint32_t s = 0; s < n_stream; ++s) {
++                k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size_s, k->nb[1], s*k->nb[2]) : nullptr);
++                v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size_s, v->nb[1], s*v->nb[2]) : nullptr);
++            }
++
++            layer_stages.push_back({ il, k, v, k_stream, v_stream, });
+         }
+ 
+         map_layer_ids[il] = layers.size();
+ 
+-        layers.push_back({ il, k, v, k_stream, v_stream, });
++        layers.push_back(layer_stages[0]);
++
++        if (kv_stages.enabled()) {
++            layer_bufts.push_back(buft);
++
++            for (uint32_t is = 0; is < n_stage; ++is) {
++                if (kv_stages_layers.size() == is) {
++                    kv_stages_layers.emplace_back();
++                }
++
++                kv_stages_layers[is].push_back(layer_stages[is]);
++            }
++        }
+     }
+ 
+     if (reuse) {
+@@ -282,6 +429,8 @@ llama_kv_cache::llama_kv_cache(
+             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+             }
++        } else if (kv_stages.enabled()) {
++            buf = alloc_stage_buffer(buft, layer_bufts);
+         } else {
+             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+         }
+@@ -299,10 +448,28 @@ llama_kv_cache::llama_kv_cache(
+         const size_t memory_size_k = size_k_bytes();
+         const size_t memory_size_v = size_v_bytes();
+ 
++        const ggml_type type_k_cur = kv_stage_capacity.empty() ? type_k : kv_stages.types[0];
++        const ggml_type type_v_cur = kv_stage_capacity.empty() ? type_v : kv_stages.types[0];
++
+         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
+-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
+-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
+-                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
++                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size_cur, (int) layers.size(), n_seq_max, n_stream,
++                ggml_type_name(type_k_cur), (float)memory_size_k / (1024.0f * 1024.0f),
++                ggml_type_name(type_v_cur), (float)memory_size_v / (1024.0f * 1024.0f));
++
++        if (kv_stages.enabled()) {
++            std::string stage_list;
++
++            for (size_t s = 0; s < kv_stages.types.size(); ++s) {
++                stage_list += ggml_type_name(kv_stages.types[s]);
++                stage_list += "(" + std::to_string(kv_stage_capacity[s]) + " cells)";
++                if (s + 1 < kv_stages.types.size()) {
++                    stage_list += " -> ";
++                }
++            }
++
++            LLAMA_LOG_INFO("%s: dynamic KV quantization: %s, budget %7.2f MiB, margin %u cells\n", __func__,
++                    stage_list.c_str(), (float) total_size() / (1024.0f * 1024.0f), kv_stages.margin);
++        }
+     }
+ 
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+@@ -319,10 +486,14 @@ llama_kv_cache::llama_kv_cache(
+             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+         }
+ 
++        // when dynamic KV quantization is enabled, rotate the cache from the start so that the
++        // stored values do not change representation when the type changes
++        const bool force_rot = kv_stages.enabled();
++
+         attn_rot_k =
+             !attn_rot_disable &&
+             n_embd_head_k_all > 0 &&
+-            ggml_is_quantized(type_k) &&
++            (ggml_is_quantized(type_k) || force_rot) &&
+             hparams.n_embd_head_k() % 64 == 0;
+ 
+         // always create Hadamard rotation tensors for DeepSeek lightning indexers
+@@ -335,7 +506,7 @@ llama_kv_cache::llama_kv_cache(
+         attn_rot_v =
+             !attn_rot_disable &&
+             n_embd_head_v_all > 0 &&
+-            ggml_is_quantized(type_v) &&
++            (ggml_is_quantized(type_v) || force_rot) &&
+             hparams.n_embd_head_v() % 64 == 0;
+     }
+ 
+@@ -700,6 +871,278 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+     return ret;
+ }
+ 
++// one region per K/V tensor, sized for the last stage and shared by the tensors of all stages
++ggml_backend_buffer_t llama_kv_cache::alloc_stage_buffer(
++        ggml_backend_buffer_type_t buft, const std::vector<ggml_backend_buffer_type_t> & layer_bufts) {
++        const size_t alignment = ggml_backend_buft_get_alignment(buft);
++
++        size_t budget = 0;
++
++        for (size_t l = 0; l < layers.size(); ++l) {
++            if (layer_bufts[l] != buft) {
++                continue;
++            }
++
++            const auto & kl = kv_stages_layers.back()[l];
++
++            budget += ggml_backend_buft_get_alloc_size(buft, kl.k);
++            if (kl.v) {
++                budget += ggml_backend_buft_get_alloc_size(buft, kl.v);
++            }
++        }
++
++        // reserve some padding for the region alignment
++        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, budget + 2*alignment*(layers.size() + 1));
++        if (!buf) {
++            throw std::runtime_error("failed to allocate buffer for kv cache");
++        }
++
++        size_t offset = 0;
++
++        const auto alloc_region = [&](size_t l, bool is_v) {
++            const auto & kl = kv_stages_layers.back()[l];
++
++            const size_t size_region = ggml_backend_buft_get_alloc_size(buft, is_v ? kl.v : kl.k);
++
++            offset = GGML_PAD(offset, alignment);
++
++            char * addr = (char *) ggml_backend_buffer_get_base(buf) + offset;
++
++            for (size_t s = 0; s < kv_stages_layers.size(); ++s) {
++                ggml_tensor * t = is_v ? kv_stages_layers[s][l].v : kv_stages_layers[s][l].k;
++
++                if (ggml_backend_buft_get_alloc_size(buft, t) > size_region) {
++                    throw std::runtime_error("dynamic KV quantization: stage does not fit the memory budget");
++                }
++
++                if (ggml_backend_tensor_alloc(buf, t, addr) != GGML_STATUS_SUCCESS) {
++                    throw std::runtime_error("failed to allocate kv cache tensor");
++                }
++
++                const auto & views = is_v ? kv_stages_layers[s][l].v_stream : kv_stages_layers[s][l].k_stream;
++
++                for (ggml_tensor * view : views) {
++                    if (!view) {
++                        continue;
++                    }
++
++                    if (ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) {
++                        throw std::runtime_error("failed to initialize kv cache view");
++                    }
++                }
++            }
++
++            offset += size_region;
++        };
++
++        for (size_t l = 0; l < layers.size(); ++l) {
++            if (layer_bufts[l] != buft) {
++                continue;
++            }
++
++            alloc_region(l, false);
++
++            if (kv_stages_layers.back()[l].v) {
++                alloc_region(l, true);
++            }
++        }
++
++    return buf;
++}
++
++// flag set on the stream count of a saved state that carries the dynamic KV quantization stage
++static constexpr uint32_t KV_STATE_STAGE_TAG = 0x40000000u;
++
++// convert the first n_rows rows of a K/V cache stream in place (src and dst share the same memory)
++// shrinking rows are processed from the start and growing rows from the end, so no unread row is overwritten
++static void kv_convert_rows(ggml_tensor * src, ggml_tensor * dst, int64_t n_rows) {
++    GGML_ASSERT(src->ne[0] == dst->ne[0]);
++    GGML_ASSERT(src->data == dst->data);
++
++    if (n_rows == 0) {
++        return;
++    }
++
++    const auto * tr_old = ggml_get_type_traits(src->type);
++    const auto * tr_new = ggml_get_type_traits(dst->type);
++
++    const int64_t ne0     = src->ne[0];
++    const size_t  row_old = ggml_row_size(src->type, ne0);
++    const size_t  row_new = ggml_row_size(dst->type, ne0);
++
++    GGML_ASSERT(n_rows <= src->ne[1] && n_rows <= dst->ne[1]);
++
++    const int64_t n_chunk = std::max<int64_t>(1, std::min<int64_t>(n_rows, (int64_t) ((64u << 20)/std::max(row_old, row_new))));
++
++    std::vector<uint8_t> buf_src(n_chunk*row_old);
++    std::vector<uint8_t> buf_dst(n_chunk*row_new);
++
++    const int64_t n_threads = std::max<int64_t>(1, std::min<int64_t>(16, std::thread::hardware_concurrency()));
++
++    // the rows are independent, so each chunk is converted by several threads
++    const auto convert_range = [&](int64_t i0, int64_t i1) {
++        std::vector<float> f32(ne0);
++
++        for (int64_t i = i0; i < i1; ++i) {
++            tr_old->to_float(buf_src.data() + i*row_old, f32.data(), ne0);
++            tr_new->from_float_ref(f32.data(), buf_dst.data() + i*row_new, ne0);
++        }
++    };
++
++    const auto convert = [&](int64_t a, int64_t n) {
++        ggml_backend_tensor_get(src, buf_src.data(), a*row_old, n*row_old);
++
++        const int64_t n_per_thread = (n + n_threads - 1)/n_threads;
++
++        std::vector<std::thread> workers;
++        for (int64_t i0 = n_per_thread; i0 < n; i0 += n_per_thread) {
++            workers.emplace_back(convert_range, i0, std::min(n, i0 + n_per_thread));
++        }
++
++        convert_range(0, std::min(n, n_per_thread));
++
++        for (auto & w : workers) {
++            w.join();
++        }
++
++        ggml_backend_tensor_set(dst, buf_dst.data(), a*row_new, n*row_new);
++    };
++
++    if (row_new <= row_old) {
++        for (int64_t a = 0; a < n_rows; a += n_chunk) {
++            convert(a, std::min<int64_t>(n_rows - a, n_chunk));
++        }
++    } else {
++        for (int64_t a = n_rows; a > 0; ) {
++            const int64_t n = std::min<int64_t>(a, n_chunk);
++            a -= n;
++
++            convert(a, n);
++        }
++    }
++}
++
++// zero the rows [n0, n1) of a K/V cache stream, so that the stale bytes of another stage layout
++// are not interpreted as values of this type (some bit patterns can decode to NaN)
++static void kv_zero_rows(ggml_tensor * t, uint32_t n0, uint32_t n1) {
++    if (n1 <= n0) {
++        return;
++    }
++
++    const size_t row = ggml_row_size(t->type, t->ne[0]);
++
++    ggml_backend_tensor_memset(t, 0, n0*row, (n1 - n0)*row);
++}
++
++uint32_t llama_kv_cache::stage_used() const {
++    uint32_t used = 0;
++
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        used = std::max(used, v_cells[s].used_max_p1());
++    }
++
++    return used;
++}
++
++bool llama_kv_cache::set_stage(uint32_t stage) {
++    if (kv_stages_layers.empty() || stage >= kv_stages_layers.size()) {
++        return false;
++    }
++
++    if (stage == kv_stage_cur) {
++        return true;
++    }
++
++    const uint32_t used    = stage_used();
++    const uint32_t cap_new = kv_stage_capacity[stage];
++
++    if (used > cap_new) {
++        return false;
++    }
++
++    const int64_t t_start_us = ggml_time_us();
++
++    const ggml_type type_old = kv_stages.types[kv_stage_cur];
++    const ggml_type type_new = kv_stages.types[stage];
++
++    const auto & layers_new = kv_stages_layers[stage];
++
++    GGML_ASSERT(layers_new.size() == layers.size());
++
++    for (size_t l = 0; l < layers.size(); ++l) {
++        for (uint32_t s = 0; s < n_stream; ++s) {
++            kv_convert_rows(layers[l].k_stream[s], layers_new[l].k_stream[s], used);
++            kv_zero_rows(layers_new[l].k_stream[s], used, cap_new);
++
++            if (layers[l].v) {
++                kv_convert_rows(layers[l].v_stream[s], layers_new[l].v_stream[s], used);
++                kv_zero_rows(layers_new[l].v_stream[s], used, cap_new);
++            }
++        }
++    }
++
++    kv_stage_cur = stage;
++    layers = layers_new;
++
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        v_cells[s].resize_preserve(cap_new);
++        v_heads[s] = std::min(v_heads[s], used);
++    }
++
++    kv_requantized = true;
++
++    LLAMA_LOG_INFO("%s: converted KV cache %s -> %s, %u cells in use, capacity %u cells (%.2f ms)\n", __func__,
++            ggml_type_name(type_old), ggml_type_name(type_new), used, get_size(), (ggml_time_us() - t_start_us)/1000.0);
++
++    return true;
++}
++
++bool llama_kv_cache::try_requantize() {
++    if (kv_stage_cur + 1 >= kv_stages_layers.size() || layers.empty()) {
++        return false;
++    }
++
++    return set_stage(kv_stage_cur + 1);
++}
++
++bool llama_kv_cache::try_requantize_if_needed() {
++    if (kv_stage_cur + 1 >= kv_stages_layers.size() || kv_stages.margin == 0) {
++        return false;
++    }
++
++    if (stage_used() + kv_stages.margin < get_size()) {
++        return false;
++    }
++
++    return try_requantize();
++}
++
++bool llama_kv_cache::try_restore_stage() {
++    if (kv_stage_cur == 0 || kv_stages_layers.empty()) {
++        return false;
++    }
++
++    // go back to the highest-precision stage that is at most half full after the switch
++    // the cells in use keep their lower precision, so only the free half gains from it
++    const uint32_t used = stage_used();
++
++    for (uint32_t s = 0; s < kv_stage_cur; ++s) {
++        if ((uint64_t) used + 2ull*kv_stages.margin <= kv_stage_capacity[s] && 2ull*used <= kv_stage_capacity[s]) {
++            return set_stage(s);
++        }
++    }
++
++    return false;
++}
++
++bool llama_kv_cache::check_and_clear_requantized() {
++    const bool res = kv_requantized;
++
++    kv_requantized = false;
++
++    return res;
++}
++
+ llama_memory_context_ptr llama_kv_cache::init_batch(
+             llama_batch_allocr & balloc,
+             uint32_t n_ubatch,
+@@ -725,7 +1168,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
+             break;
+         }
+ 
+-        auto sinfos = prepare(ubatches);
++        auto sinfos = prepare_staged(ubatches);
+         if (sinfos.empty()) {
+             break;
+         }
+@@ -749,6 +1192,21 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+     return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
+ }
+ 
++llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_staged(const std::vector<llama_ubatch> & ubatches) {
++    // a cache that emptied out (new conversation, subagent, ...) goes back to a higher precision
++    try_restore_stage();
++
++    auto res = prepare(ubatches);
++    if (!res.empty()) {
++        // convert early if the next stage was requested to start before the cache is full
++        try_requantize_if_needed();
++    } else if (try_requantize()) {
++        res = prepare(ubatches);
++    }
++
++    return res;
++}
++
+ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+     llama_kv_cache::slot_info_vec_t res;
+ 
+@@ -2099,7 +2557,16 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+ 
+     GGML_UNUSED(flags);
+ 
+-    io.write(&n_stream, sizeof(n_stream));
++    if (kv_stages_layers.empty()) {
++        io.write(&n_stream, sizeof(n_stream));
++    } else {
++        // dynamic KV quantization: tag the state with the active stage, so that it can be restored
++        // into a cache that is currently at a different stage
++        const uint32_t n_stream_tagged = n_stream | KV_STATE_STAGE_TAG;
++
++        io.write(&n_stream_tagged, sizeof(n_stream_tagged));
++        io.write(&kv_stage_cur,    sizeof(kv_stage_cur));
++    }
+ 
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         cell_ranges_t cr { s, {} };
+@@ -2191,6 +2658,22 @@ const slot_info_vec_t *   sinfos_in) {
+ 
+     uint32_t n_stream_cur;
+     io.read(&n_stream_cur, sizeof(n_stream_cur));
++
++    // dynamic KV quantization: the stage the state was saved at
++    int64_t stage_saved = -1;
++    if (n_stream_cur & KV_STATE_STAGE_TAG) {
++        n_stream_cur &= ~KV_STATE_STAGE_TAG;
++
++        uint32_t stage;
++        io.read(&stage, sizeof(stage));
++
++        if (kv_stages_layers.empty()) {
++            throw std::runtime_error("the state was saved with dynamic KV quantization, which is not enabled");
++        }
++
++        stage_saved = stage;
++    }
++
+     if (n_stream_cur != n_stream) {
+         throw std::runtime_error("n_stream mismatch");
+     }
+@@ -2201,6 +2684,18 @@ const slot_info_vec_t *   sinfos_in) {
+         clear(true);
+     }
+ 
++    // switch to the stage of the saved state so the rows are copied as they are
++    // the sequence is dropped first: it is replaced anyway, and its cells could block a smaller stage
++    if (stage_saved >= 0 && (uint32_t) stage_saved != kv_stage_cur) {
++        if (seq_id != -1) {
++            seq_rm(seq_id, -1, -1);
++        }
++
++        if (!set_stage((uint32_t) stage_saved)) {
++            throw std::runtime_error("failed to restore kv cache: cannot switch to the KV quantization stage of the state");
++        }
++    }
++
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         uint32_t cell_count;
+         io.read(&cell_count, sizeof(cell_count));
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699..3f90012 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -114,7 +114,9 @@ public:
+         const  layer_reuse_cb & reuse,
+         const  layer_share_cb & share,
+         // a model can hold more than one cache, so the tensor names have to stay unique
+-                 const char *   name_tag = "");
++                 const char *   name_tag = "",
++        // dynamic quantization stages for the K/V cache
++        const llama_kv_stages & stages = {});
+ 
+     ~llama_kv_cache() = default;
+ 
+@@ -133,6 +135,8 @@ public:
+ 
+     bool get_can_shift() const override;
+ 
++    bool check_and_clear_requantized() override;
++
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+@@ -201,6 +205,9 @@ public:
+     // return empty vector on failure
+     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
+ 
++    // prepare(), switching the quantization stage when the cache emptied out or is full
++    slot_info_vec_t prepare_staged(const std::vector<llama_ubatch> & ubatches);
++
+     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+ 
+     // find a slot of kv cells that can hold the ubatch
+@@ -310,6 +317,35 @@ private:
+ 
+     std::vector<kv_layer> layers;
+ 
++    // all quantization stages: kv_stages_layers[s] holds the tensors of stage s
++    // the active stage is kv_stage_cur and its tensors are mirrored in `layers`
++    llama_kv_stages kv_stages;
++    uint32_t kv_stage_cur = 0;
++    bool     kv_requantized = false;
++
++    std::vector<std::vector<kv_layer>> kv_stages_layers;
++
++    // the number of cells each stage can hold within the fixed memory budget
++    std::vector<uint32_t> kv_stage_capacity;
++
++    // the number of cells that have to be kept when converting the cache (max over the streams)
++    uint32_t stage_used() const;
++
++    // convert the cache to the next quantization stage; false if there is none or it cannot hold the cells in use
++    bool try_requantize();
++
++    // convert the cache to the next stage if the number of free cells dropped below the margin
++    bool try_requantize_if_needed();
++
++    // convert the cache back to the highest-precision stage that fits the cells in use
++    bool try_restore_stage();
++
++    // convert the cache to the given stage; false if it does not exist or cannot hold the cells in use
++    bool set_stage(uint32_t stage);
++
++    ggml_backend_buffer_t alloc_stage_buffer(
++            ggml_backend_buffer_type_t buft, const std::vector<ggml_backend_buffer_type_t> & layer_bufts);
++
+     // model layer id -> KV cache layer id
+     std::unordered_map<int32_t, int32_t> map_layer_ids;
+ 
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 5167c03..fe79bf5 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -73,6 +73,26 @@ public:
+         reset();
+     }
+ 
++    // grow or shrink the cell storage, preserving the existing cells
++    // when shrinking, all the used cells must be below the new size
++    void resize_preserve(uint32_t n) {
++        GGML_ASSERT(used_max_p1() <= n);
++
++        const uint32_t n_old = pos.size();
++
++        pos.resize(n);
++        ext.resize(n);
++        shift.resize(n);
++        seq.resize(n);
++
++        for (uint32_t i = n_old; i < n; ++i) {
++            pos[i] = -1;
++            ext[i].reset();
++            shift[i] = 0;
++            seq[i].reset();
++        }
++    }
++
+     bool is_empty(uint32_t i) const {
+         assert(i < pos.size());
+         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 42c7381..5d4e871 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
+                      bool   unified,
+                             /* layer filters */
+     const layer_filter_cb & filter_attn,
+-    const layer_filter_cb & filter_recr) :
++    const layer_filter_cb & filter_recr,
++    const llama_kv_stages & stages) :
+     hparams(model.hparams),
+     mem_attn(new llama_kv_cache(
+         model,
+@@ -49,7 +50,9 @@ llama_memory_hybrid::llama_memory_hybrid(
+             [&](int32_t il) { return !hparams.is_recr(il); }
+             : filter_attn,
+         nullptr,
+-        nullptr
++        nullptr,
++        "",
++        stages
+     )),
+     mem_recr(new llama_memory_recurrent(
+         model,
+@@ -109,7 +112,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
+         }
+ 
+         // prepare the attention cache
+-        auto heads_attn = mem_attn->prepare(ubatches);
++        auto heads_attn = mem_attn->prepare_staged(ubatches);
+         if (heads_attn.empty()) {
+             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
+             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+@@ -135,6 +138,10 @@ bool llama_memory_hybrid::get_can_shift() const {
+     return mem_attn->get_can_shift();
+ }
+ 
++bool llama_memory_hybrid::check_and_clear_requantized() {
++    return mem_attn->check_and_clear_requantized();
++}
++
+ void llama_memory_hybrid::clear(bool data) {
+     mem_attn->clear(data);
+     mem_recr->clear(data);
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb..5ac13b6 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -39,7 +39,8 @@ public:
+                      bool   unified,
+                             /* layer filters */
+     const layer_filter_cb & filter_attn = nullptr,
+-    const layer_filter_cb & filter_recr = nullptr);
++    const layer_filter_cb & filter_recr = nullptr,
++    const llama_kv_stages & stages      = {});
+ 
+     ~llama_memory_hybrid() = default;
+ 
+@@ -58,6 +59,8 @@ public:
+ 
+     bool get_can_shift() const override;
+ 
++    bool check_and_clear_requantized() override;
++
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index db82539..e8d1cb3 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -6,6 +6,7 @@
+ #include <map>
+ #include <memory>
+ #include <functional>
++#include <vector>
+ 
+ struct llama_ubatch;
+ 
+@@ -14,11 +15,28 @@ class llama_batch_allocr;
+ class llama_io_write_i;
+ class llama_io_read_i;
+ 
++// dynamic quantization stages for the attention KV cache
++struct llama_kv_stages {
++    // applied in order as the cache fills; types[0] is the initial type and types.back() is the
++    // final type. the cache memory is sized to hold the final type at the full context
++    std::vector<ggml_type> types;
++
++    // start the next stage when the number of free cells drops below this value
++    uint32_t margin = 0;
++
++    bool enabled() const {
++        return types.size() > 1;
++    }
++};
++
+ struct llama_memory_params {
+     // kv cache
+     ggml_type type_k;
+     ggml_type type_v;
+ 
++    // dynamic KV quantization
++    llama_kv_stages stages;
++
+     // use full-size SWA cache
+     bool swa_full;
+ 
+@@ -100,6 +118,12 @@ struct llama_memory_i {
+     // getters
+     virtual bool get_can_shift() const = 0;
+ 
++    // returns true once if the cache was requantized since the last call
++    // used to re-reserve the compute buffers after the KV cache type changes
++    virtual bool check_and_clear_requantized() {
++        return false;
++    }
++
+     //
+     // ops
+     //
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 65a6702..9b78139 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2206,6 +2206,12 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
+ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+     llama_memory_i * res;
+ 
++    // dynamic KV quantization applies to the main context only, not to the MTP draft head
++    llama_kv_stages kv_stages = params.stages;
++    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
++        kv_stages.types.clear();
++    }
++
+     switch (arch) {
+         // Models that need specific instantiation should be handled in the
+         // switch statement
+@@ -2538,7 +2544,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* offload           */ cparams.offload_kqv,
+                             /* unified           */ cparams.kv_unified,
+                             /* filter_attn       */ std::move(filter_attn),
+-                            /* filter_recr       */ std::move(filter_recr));
++                            /* filter_recr       */ std::move(filter_recr),
++                            /* stages            */ kv_stages);
+                     }
+                 } else {
+                     llama_kv_cache::layer_filter_cb filter = nullptr;
+@@ -2640,7 +2647,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                                 nullptr,
+                                 filter,
+                                 nullptr,
+-                                nullptr);
++                                nullptr,
++                                "",
++                                kv_stages);
+                     }
+                 }
+             }

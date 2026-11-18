@@ -1,0 +1,66 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "sqush": {
+      "name": "Sqush",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen 3.8 27b",
+          "reasoning": true,
+          "tools": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 65536
+          }
+        },
+        "qwen3.8-27b-vision": {
+          "name": "Qwen 3.8 27b Visual",
+          "reasoning": true,
+          "tools": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 65536
+          }
+        },
+        "qwen3.8-27b-1bit": {
+          "name": "Qwen 3.8 27b 1-bit",
+          "reasoning": true,
+          "tools": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 98304,
+            "output": 16384
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+diff --git a/src/llama-grammar.cpp b/src/llama-grammar.cpp
+index f14215a..40ce841 100644
+--- a/src/llama-grammar.cpp
++++ b/src/llama-grammar.cpp
+@@ -10,7 +10,7 @@
+ #include <set>
+ #include <stdexcept>
+ 
+-#define MAX_REPETITION_THRESHOLD 2000
++#define MAX_REPETITION_THRESHOLD 8192
+ //
+ // helpers
+ //

@@ -1,0 +1,9 @@
+[Unit]
+Description=Enable Wake-on-LAN on @WOL_IFACE@
+
+[Service]
+Type=oneshot
+ExecStart=@ETHTOOL@ -s @WOL_IFACE@ wol g
+
+[Install]
+WantedBy=multi-user.target

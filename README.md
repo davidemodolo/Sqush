@@ -1,240 +1,123 @@
 # Sqush
 
-> **Sqush  Qwen  Under  Small  Hardware**
->
-> Sqush is a recursive acronym, like Wine. It squashes Qwen models onto consumer GPUs
-> — 27B into 24GB, 9B into 8GB — with 4-bit everything and full 256k context.
->
-> Inspired by antirez's [DwarfStar4](https://github.com/antirez/dwarfstar4).
+Runs Qwen3.8-27B (UD-IQ4_XS GGUF) with llama.cpp on a single 24 GB GPU (RTX 3090) at the full
+262k context, exposed as an OpenAI-compatible API for opencode. It uses a patched llama.cpp with
+**dynamic KV cache quantization**.
 
-**Run Qwen models quantized on a single GPU — 8 GB or 24 GB VRAM.**
+## Requirements
 
-4-bit weights + 4-bit KV cache + blockwise attention.
-Multimodal text + image input. Drop-in OpenAI-compatible API. Local, private, zero config.
+- Linux x86_64 with an NVIDIA GPU: 24 GB of VRAM, or ~8 GB for the 1-bit variant.
+- NVIDIA driver and CUDA toolkit (`nvcc`, e.g. `sudo apt install nvidia-cuda-toolkit`).
+- `git`, `curl`, `python3`, and `jq` to register the models in opencode.
+- ~20 GB of disk for the model plus ~2 GB for the build. The prompt cache uses up to 16 GB of
+  RAM (4 GB in 1-bit mode, see `CACHE_RAM`).
 
-## Features
+cmake and ninja are downloaded into `tools/` when not installed. `install.sh` also installs the
+[llama.app](https://llama.app) CLI in `~/.local/bin`, used only to download the model. The Q8_0
+vision projector comes from `ggml-org/Qwen3.8-27B-GGUF` (`MMPROJ_URL`).
 
-- **Full 256k context** on consumer hardware - custom blockwise GQA attention keeps KV cache at native 4 KV heads
-- **4-bit everything** - NF4 weights (bitsandbytes) + int4 append-only KV cache (never re-quantizes)
-- **OpenAI-compatible API** - swap `base_url` and use any OpenAI client, agents, or tools
-- **Streaming (SSE)** - real token streaming with proper `reasoning_content` + `tool_calls` delta emission
-- **Tool calling** - model uses `<tool_call>` XML, server parses it incrementally into OpenAI-format deltas
-- **Image input** - Qwen3.6-VL vision encoder processes images via `image_url` content parts (base64 data URLs)
-- **Interactive CLI** - Rich-based chat with session reuse, `/clear`, `/vram`, `/system` commands
-- **Session KV reuse** - subsequent requests sharing the same prompt prefix skip redundant prefill
-
-## VRAM Tiers
-
-Sqush auto-detects your GPU and picks the right model and settings:
-
-| VRAM | Model | Download | Disk after bake | Context | Weight Bits | KV Bits |
-|------|-------|----------|-----------------|---------|-------------|---------|
-| 8 GB | Qwen3.5-9B (pre-quantized) | 8.6 GB | ~6.7 GB | 256k | 4-bit NF4 | 4-bit int4 |
-| 24 GB | Qwen3.6-27B | 52 GB | ~18 GB | 256k | 4-bit NF4 | 4-bit int4 |
-
-Both tiers *bake* the model on first run: they quantize it to a compact NF4 checkpoint on disk and delete the bulky raw download. Baking needs ~70 GB free transiently (raw + cooked) but leaves only the cooked model afterwards. Subsequent starts load the cooked checkpoint directly — smaller on disk and faster to start (no re-quantization).
-
-Override auto-detection with `--vram`:
+## Setup
 
 ```bash
-./run.sh --vram 8 serve      # force 8GB profile
-python -m sqush --vram 8 serve
+git clone https://github.com/davidemodolo/Sqush.git && cd Sqush
+./install.sh
 ```
 
-The 8 GB tier uses [`techwithsergiu/Qwen3.5-9B-bnb-4bit`](https://huggingface.co/techwithsergiu/Qwen3.5-9B-bnb-4bit) — a pre-quantized bitsandbytes NF4 checkpoint, just 8.6 GB to download. On first run, Sqush *bakes* it: the embedding table (`embed_tokens`, 1.93 GB in bfloat16) is quantized to 4-bit per-group asymmetric format and saved as a side-car file. The baked model is cached; subsequent starts load it directly. bitsandbytes does not quantize `nn.Embedding` layers, so Sqush handles that itself. The `lm_head` projection (another 2.03 GB in bfloat16, kept unquantized by the upstream checkpoint) is quantized to NF4 at load time, saving a further ~1.45 GB. Together this keeps loading and inference well within the 8 GB budget, leaving headroom for long contexts.
+It asks for each setting with a suggestion detected from the machine (variant from the GPU memory,
+model directory, port, opencode config) and saves the server settings in `config.env`. Set a
+variable in the environment to skip its question, e.g. `VARIANT=1bit ./install.sh` for ~8 GB VRAM
+laptops. Non-interactive runs take the suggestions. Re-run it anytime to update.
 
-Image inputs on the 8 GB tier are capped at 131,072 pixels (≈ 362 × 362) before being passed to the vision encoder. Images larger than this are downscaled to fit. This is necessary because the vision encoder's self-attention over image patches generates large bfloat16 activation tensors — at full 1024 × 1024 resolution (4096 patches) this exceeds the VRAM budget regardless of weight quantization. At the cap, the vision encoder sees 512 patches instead of 4096, keeping activation memory within budget.
+### Setup with a coding agent
 
-The 24 GB tier downloads the full Qwen3.6-27B model (~52 GB in bfloat16) and bakes it on first run: it loads the model with bitsandbytes NF4, serializes the packed 4-bit weights to a compact cooked checkpoint (~18 GB), and deletes the 52 GB raw download. This is a one-time GPU operation (~1 min on an RTX 3090); every subsequent start loads the cooked NF4 checkpoint directly instead of re-quantizing bfloat16 weights from scratch. The bake needs the raw and cooked models on disk simultaneously (~70 GB transient), then settles at ~18 GB.
+To let a coding agent (opencode, Claude Code, Codex, ...) do the setup, give it this prompt:
 
-## Quickstart
+```text
+Set up Sqush (https://github.com/davidemodolo/Sqush) on this machine: a patched llama.cpp
+server that runs Qwen3.8-27B locally as an OpenAI-compatible API.
+
+1. Clone the repo (skip if already inside it) and read README.md before doing anything else.
+2. Check the requirements: Linux x86_64, an NVIDIA GPU (nvidia-smi), the CUDA toolkit (nvcc),
+   git, curl, python3, jq, ~25 GB of free disk. List what is missing and ask me before
+   installing anything with sudo or the package manager.
+3. Pick the variant from the GPU memory: VARIANT=full with ~24 GB of VRAM, VARIANT=1bit with
+   ~8-20 GB. Below that, stop and tell me.
+4. Run ./install.sh non-interactively with the variant set in the environment, e.g.
+   VARIANT=full ./install.sh < /dev/null. It downloads ~20 GB and builds llama.cpp, so it can
+   take a while; if it fails, read the error, fix the cause and run it again.
+5. Start ./serve.sh in the background, wait until GET http://127.0.0.1:<PORT>/v1/models answers
+   (PORT is in config.env), then send one short chat completion and check the reply.
+6. Report the variant, the port, the opencode model ids and how to start and stop the server.
+
+Do not set up remote access (remote/) unless I ask, and do not change the files in patches/.
+```
+
+## Run
 
 ```bash
-./run.sh download    # download Qwen3.6-27B (one-time, ~52 GB)
-./run.sh serve       # bakes to ~18 GB on first run, then starts the API on 127.0.0.1:9898
+./serve.sh            # text only
+./serve.sh --vision   # + image input (~23.5 GB VRAM, close other GPU apps)
+./serve.sh --1bit     # laptop mode (the default after VARIANT=1bit ./install.sh)
+./serve.sh --kv-static  # plain q4_0 KV cache instead of dynamic quantization
+KV_TYPE=q8_0 CTX=131072 ./serve.sh --kv-static  # another static KV type
 ```
 
-The first `serve` (or `chat`) bakes the model and deletes the raw download — ensure ~70 GB free for that one-time step. You can also bake explicitly first:
+API: `http://127.0.0.1:8080/v1` by default.
+In opencode the models are `sqush/qwen3.8-27b`, `sqush/qwen3.8-27b-vision` (needs `--vision`) and
+`sqush/qwen3.8-27b-1bit`; `opencode.json` is an example of the provider block `install.sh` writes.
+All tuning knobs (context, ports, stages, cache sizes) are env vars listed at the top of `serve.sh`;
+the environment overrides `config.env`.
+
+## Dynamic KV cache quantization
+
+The KV memory is sized for q4_0 at the full context. The cache starts at full precision and is
+converted to a smaller type when it runs out of room:
+
+| Stage | Holds up to (262k ctx) |
+|-------|------------------------|
+| f16   | ~74k tokens            |
+| q8_0  | ~139k tokens           |
+| q4_0  | 262k tokens            |
+
+- Each conversion pauses generation once (~3 s for f16 → q8_0 at full size); it runs on the
+  CPU, multi-threaded.
+- When the cache empties out (new session, subagent) it goes back to f16. Tokens that were
+  already converted keep the lower precision.
+- Idle sessions are kept in a 16 GB RAM prompt cache (`CACHE_RAM`) together with their stage,
+  so switching back to a session (e.g. main agent after a subagent) restores it in a second
+  instead of reprocessing it.
+
+## Patches
+
+`build.sh` fetches llama.cpp `50f068f` into `llama.cpp/`, applies every file in `patches/` and builds
+`llama.cpp/build/bin/llama-server` for the local GPU.
+
+| Patch | Change |
+|-------|--------|
+| `dynamic-kv-quant.patch` | the dynamic KV cache quantization above |
+| `grammar-repetition-limit.patch` | raises the grammar repetition limit from 2000 to 8192, so grammars with larger repetition counts are accepted |
+
+To change them: edit the sources in `llama.cpp/`, then
 
 ```bash
-./run.sh bake        # quantize + save compact cooked model, delete the raw one
+git -C llama.cpp diff -- . ':(exclude)src/llama-grammar.cpp' > patches/dynamic-kv-quant.patch
+git -C llama.cpp diff -- src/llama-grammar.cpp > patches/grammar-repetition-limit.patch
+./build.sh
 ```
 
-That's it. Test with:
+## Remote access
 
-```bash
-curl http://127.0.0.1:9898/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"Qwen/Qwen3.6-27B","messages":[{"role":"user","content":"Hi!"}]}'
-```
+The setup above serves the model on this machine only. To run it as a headless server reachable
+from other devices over Tailscale, see [remote/README.md](remote/README.md).
 
-Other commands:
+## Benchmarks
 
-```bash
-./run.sh chat         # interactive CLI
-./run.sh info         # show config and VRAM
-./run.sh init         # register in OpenCode config
-```
+Run against a live server; the port comes from `config.env` (`BENCH_HOST` overrides the URL):
 
-`run.sh` handles everything: venv creation, CUDA 12.6 PyTorch install, dependencies, and a transformer docstring patch for Python 3.14.
-
-## Use with OpenCode
-
-Register Sqush as a local provider:
-
-```bash
-./run.sh init
-```
-
-This writes the provider config to `~/.config/opencode/opencode.json`. Then in OpenCode, run `/models` and select `sqush/qwen3.6-27b`.
-
-Or add it manually - in your `opencode.json`:
-
-```json
-{
-  "provider": {
-    "sqush": {
-      "name": "Sqush (local)",
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "http://127.0.0.1:9898/v1",
-        "apiKey": "local"
-      },
-      "models": {
-        "qwen3.6-27b": {
-          "name": "Qwen3.6 27B 4-bit (local)",
-          "reasoning": true,
-          "tools": true,
-          "modalities": {
-            "input": ["text", "image"],
-            "output": ["text"]
-          },
-          "limit": { "context": 262144, "output": 65536 }
-        }
-      }
-    }
-  }
-}
-```
-
-## Configuration
-
-Edit `config.yaml` (or use `SQUSH_*` env vars):
-
-```yaml
-model:
-  repo: "Qwen/Qwen3.6-27B"
-  cache_dir: "./models"
-
-inference:
-  max_context: 262144     # full 256k
-  max_new_tokens: 65536
-  temperature: 0.7
-
-server:
-  host: "127.0.0.1"
-  port: 9898
-```
-
-## API
-
-OpenAI-compatible at `http://127.0.0.1:9898`:
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Liveness check |
-| `GET` | `/health/vram` | GPU memory stats |
-| `POST` | `/v1/chat/completions` | Chat completion (streaming + non-streaming) |
-
-Streaming returns `reasoning_content` deltas for model thinking and `tool_calls` deltas when tools are provided.
-
-### Image input
-
-Send images as base64 data URLs using OpenAI-compatible `image_url` content parts:
-
-```bash
-curl http://127.0.0.1:9898/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"Qwen/Qwen3.6-27B",
-    "messages":[{
-      "role":"user",
-      "content":[
-        {"type":"text","text":"What do you see in this image?"},
-        {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
-      ]
-    }]
-  }'
-```
-
-Images are processed by Qwen3.6-VL's vision encoder via chunked prefill. The resulting KV cache is saved, so follow-up text messages in the same conversation reuse it without re-running the vision encoder. Only base64 data URLs are supported — remote URLs are not yet handled.
-
-## Text Performance
-
-All benchmarks: Python 3.14, torch 2.12.1+cu126, 4-bit NF4 weights, int4 KV cache.
-
-### Qwen3.6-27B (24 GB VRAM, RTX 3090)
-
-| Context | Peak VRAM | Prefill | Decode |
-|---------|-----------|---------|--------|
-| 3k | 17.1 GB | 3.0s | 11.0 tok/s |
-| 16k | 17.3 GB | 20.8s | 6.7 tok/s |
-| 32k | 17.6 GB | 52.9s | 4.4 tok/s |
-| 64k | 18.1 GB | 151.1s | 2.6 tok/s |
-| 128k | 19.1 GB | 480.3s | 1.4 tok/s |
-| 256k | 21.2 GB | 1649.6s | 0.8 tok/s |
-
-Weights: ~16.5 GB (NF4). KV cache: ~4.3 GB at 256k (int4, append-only). Headroom: ~2 GB.
-
-### Qwen3.5-9B (8 GB VRAM, RTX 4060 Ti)
-
-| Target | Actual | Prefill | Decode | Peak VRAM |
-|--------|--------|---------|--------|-----------|
-| 3,000 | 2,986 | 1.4s | 19.5t/s | 5.6 GB |
-| 16,000 | 15,986 | 8.9s | 12.4t/s | 5.7 GB |
-| 32,000 | 31,986 | 22.5s | 8.6t/s | 5.8 GB |
-| 64,000 | 63,986 | 61.9s | 5.3t/s | 6.1 GB |
-| 128,000 | 127,986 | 185.9s | 3.0t/s | 6.6 GB |
-| 256,000 | 255,986 | 661.9s | 1.3t/s | 7.6 GB |
-
-Weights: ~5.5 GB (NF4 + embedding quantization). KV cache: ~2.0 GB at 256k. 256k fits within 8 GB VRAM.
-
-Decode speed drops with context length because blockwise attention iterates over all cached blocks per token, dequantizing each block on the fly. At low context it's fast; at 256k it's compute-bound by the Python dispatch overhead. Future work: Triton kernel to fuse dequant + attention in a single pass.
-
-## Session KV reuse
-
-The server keeps the KV cache alive between requests in the same session. If your next request appends to the same conversation, prefill is skipped — only the new tokens are processed. This makes multi-turn chat fast after the first message.
-
-This applies to both text-only and vision conversations. When an image appears in the conversation history, the vision encoder runs once for that turn and the resulting KV states are cached; subsequent text follow-ups extend the same cache rather than re-processing the image.
-
-Reuse is verified at the token level: the new prompt must start with exactly the tokens the cache was built from. For a hit on thinking turns, the client must send the previous reply's reasoning back (`reasoning_content` on the assistant message, as returned by the API) — if the reasoning is dropped, the re-rendered history no longer matches the cached tokens and prefill restarts from scratch.
-
-**Constraint:** one concurrent conversation per server instance. If you send a request that doesn't share the prefix (editing a prior message, switching conversations, or a shorter history than what was cached), the cache is invalidated and prefill restarts. For multiple independent sessions, run multiple server instances on different ports.
-
-## Testing
-
-The test suite runs entirely without loading a model — all GPU-dependent code is replaced with mocks, so tests run on CPU in a few seconds and are safe to run in CI or on any machine.
-
-```bash
-pip install -e ".[test]"
-python -m pytest tests/
-```
-
-The suite covers:
-
-- **KV cache math** — int4 quantization, packed uint8 layout, round-trip accuracy, group-boundary edge cases, `SqushKVCache` layer structure
-- **Blockwise GQA attention** — first prefill, cached prefill with offset, decode step, causal masking, GQA grouping, numerical stability, `blockwise_attention_from_cache`
-- **Inference engine** — image extraction, message preprocessing, tokenization paths, `_prepare_generation` kwargs, session KV cache reuse (text and vision), stream and sync paths
-- **FastAPI server** — health/VRAM endpoints, models list, sync and streaming completions, SSE format, CORS, thinking/reasoning content, tool call parsing and streaming
-- **Config loading** — YAML overrides, env var precedence, defaults
-- **CLI** — history trimming, `<think>` block stripping from display output
-- **`__main__`** — OpenCode config init and path resolution, tier-aware bake dispatch (LOW side-car vs HIGH NF4)
-- **Download** — checkpoint completeness detection (resume partial downloads, reject corrupt/partial snapshots)
-
-For end-to-end smoke testing against a live server (requires a GPU and the downloaded model):
-
-```bash
-./test_sqush.sh
-```
-
-This starts the server, tests streaming and non-streaming requests, concurrent load, and verifies no `<think>` tags leak into content fields.
+| Script | What it checks |
+|--------|----------------|
+| `bench/kv_stage_test.py` | prefill/decode speed over a long prompt |
+| `bench/needle_test.py` | recall of a key at the start of a long prompt (`--reps 560` ≈ 200k tokens) |
+| `bench/vision_needle.py` | recall of an image at the start of a long prompt (needs `--vision`, Pillow) |
+| `bench/subagent_test.py` | main agent → subagent → main agent: f16 restore + RAM prompt cache |
+| `bench/kv_quality.py` | how far the predictions drift from an f16 KV cache (KL divergence), per server configuration |
