@@ -1,0 +1,8 @@
+[Unit]
+Description=Qwen wake doorbell listener (UDP)
+
+[Socket]
+ListenDatagram=0.0.0.0:@DOORBELL_PORT@
+
+[Install]
+WantedBy=sockets.target

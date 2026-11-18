@@ -1,0 +1,11 @@
+[Unit]
+Description=opencode server (headless)
+
+[Service]
+Type=simple
+User=@RUN_USER@
+WorkingDirectory=@PROJ@
+EnvironmentFile=/etc/qwen/server.env
+ExecStart=@RUN_HOME@/.opencode/bin/opencode serve --hostname 0.0.0.0 --port @OPENCODE_PORT@
+Restart=on-failure
+RestartSec=10

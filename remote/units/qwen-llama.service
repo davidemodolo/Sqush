@@ -1,0 +1,11 @@
+[Unit]
+Description=Qwen3.8-27B llama.cpp server
+
+[Service]
+Type=simple
+User=@RUN_USER@
+WorkingDirectory=@PROJ@
+Environment=HOST=0.0.0.0
+ExecStart=@PROJ@/serve.sh @SERVE_ARGS@
+Restart=on-failure
+RestartSec=10

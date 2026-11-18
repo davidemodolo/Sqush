@@ -1,0 +1,10 @@
+[Unit]
+Description=Qwen wake doorbell trigger
+Requires=qwen-doorbell.socket
+After=qwen-doorbell.socket
+
+[Service]
+Type=oneshot
+# Drain the datagrams (fd 3), or the socket keeps triggering until it hits its start limit.
+ExecStart=/bin/sh -c 'timeout 1 cat <&3 >/dev/null; exit 0'
+ExecStart=/usr/bin/systemctl start qwen.target

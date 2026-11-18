@@ -1,49 +1,7 @@
-# Python
+/models/
+/llama.cpp/
+/tools/
+/config.env
+/bench/*.json
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environment
-.venv/
-venv/
-env/
-
-# Model files (large binaries)
-models/
-*.gguf
-*.safetensors
-*.bin
-
-# KV cache
-kv/
-kvcache/
-
-# Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Install marker
-.deps_installed
-
-# LLM agent instructions
-AGENTS.md
-
-
-
-# MkDocs build output
-site/
+*.pyc
